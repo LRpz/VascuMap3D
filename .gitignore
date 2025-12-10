@@ -90,7 +90,7 @@ Thumbs.db
 *.hdf5
 crop_profiles/
 checkpoints/
-models/
+/models/
 logs/
 lightning_logs/
 outputs/
