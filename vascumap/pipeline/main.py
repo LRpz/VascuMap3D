@@ -63,7 +63,7 @@ def _iter_stacks(image_path, fluo_channel, fluo_index):
 
 
 def run(input_dir, pattern='*.lif', ortho=True, bf_index=None, fluo_channel=None, fluo_index=None,
-        crop_profile='dorota', crop_profile_dir='crop_profiles', z_range=200, save_all_stacks=False,
+        crop_profile=None, crop_profile_dir='crop_profiles', z_range=200, save_all_stacks=False,
         crop=True, model_p2p_path=None, model_smp_path=None):
     """
     Run the inference pipeline on every microscopy file of a directory.
@@ -87,7 +87,8 @@ def run(input_dir, pattern='*.lif', ortho=True, bf_index=None, fluo_channel=None
             When given, Pix2Pix is skipped. Defaults to None.
         fluo_index (int, optional): Index of the fluorescence vessel channel; same effect as
             fluo_channel. Defaults to None.
-        crop_profile (str, optional): Name of the crop profile for registration. Defaults to 'dorota'.
+        crop_profile (str, optional): Name of the crop profile for registration; required when crop is True.
+            Defaults to None.
         crop_profile_dir (str, optional): Folder holding the crop profiles. Defaults to 'crop_profiles'.
         z_range (int, optional): Z-range (um) kept around the focal surface when cropping. Defaults to 200.
         save_all_stacks (bool, optional): Save intermediate stacks (BF, prediction, probability). Defaults to False.
@@ -106,6 +107,8 @@ def run(input_dir, pattern='*.lif', ortho=True, bf_index=None, fluo_channel=None
                          "pass fluo_channel or fluo_index to segment a fluorescence channel instead")
     if model_smp_path is None:
         raise ValueError("model_smp_path is required for segmentation")
+    if crop and crop_profile is None:
+        raise ValueError("crop_profile is required when crop is True (or set crop=False / --no_crop)")
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
@@ -228,8 +231,8 @@ if __name__ == '__main__':
                         help="Index of the brightfield channel (default: found by name).")
     parser.add_argument("--no_crop", action="store_true",
                         help="Skip auto-focus and template cropping.")
-    parser.add_argument("--crop_profile", type=str, default="dorota",
-                        help="Name of the crop profile.")
+    parser.add_argument("--crop_profile", type=str, default=None,
+                        help="Name of the crop profile (required unless --no_crop).")
     parser.add_argument("--crop_profile_dir", type=str, default="crop_profiles",
                         help="Folder holding the crop profiles.")
     parser.add_argument("--z_range", type=int, default=200,

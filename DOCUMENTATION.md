@@ -75,11 +75,15 @@ The pipeline processes raw microscopy images through four main stages:
 │   Why? Brightfield images have low contrast. We translate them to           │
 │   fluorescence-like images where vessels are clearly visible.               │
 │                                                                              │
+│   Skipped when a fluorescence vessel channel is given (--fluo_channel or    │
+│   --fluo_index, e.g. the GFP channel of an .nd2 file): that channel goes    │
+│   directly to Stage 2.                                                      │
+│                                                                              │
 │                              ↓                                               │
 │                                                                              │
 │   STAGE 2: SEGMENTATION                                                      │
 │   ─────────────────────                                                      │
-│   Input:  Fluorescence-like volume                                          │
+│   Input:  Fluorescence-like volume or fluorescence channel                  │
 │   Output: Binary vessel mask                                                │
 │   Method: 2D U-Net with 2.5D inference (3-plane averaging)                  │
 │                                                                              │
@@ -101,8 +105,8 @@ The pipeline processes raw microscopy images through four main stages:
 │   STAGE 4: GRAPH ANALYSIS                                                    │
 │   ───────────────────────                                                    │
 │   Input:  Skeleton image                                                    │
-│   Output: NetworkX graph + CSV/HDF5 metrics                                 │
-│   Method: sknw graph extraction + custom metric computation                 │
+│   Output: NetworkX graph + CSV/HDF5 metrics in µm, µm², µm³                 │
+│   Method: sknw graph extraction, pruning + custom metric computation        │
 │                                                                              │
 │   Why? Graphs let us compute topological metrics: branching, tortuosity,    │
 │   vessel lengths, fractal dimension, etc.                                   │
@@ -112,7 +116,8 @@ The pipeline processes raw microscopy images through four main stages:
 
 **Data flow summary:**
 ```
-.lif file → Brightfield Z-stack → Pseudo-fluorescence → Binary mask → Skeleton → Graph → Metrics
+Brightfield input:   .lif file → Brightfield Z-stack → Pseudo-fluorescence → Binary mask → Skeleton → Graph → Metrics
+Fluorescence input:  .nd2/.czi/.lif file → Fluorescence channel ───────────→ Binary mask → Skeleton → Graph → Metrics
 ```
 
 ## 1.3 Key Concepts
@@ -143,25 +148,26 @@ Isotropic for analysis:   2 × 2 × 2 µm (Z × Y × X) - Same in all dimensions
 Vascular networks are naturally represented as graphs:
 - **Nodes** = Junction points (where vessels meet) + Endpoints (sprout tips)
 - **Edges** = Vessel segments between nodes
-- **Edge attributes** = Length, diameter, tortuosity, orientation
+- **Edge attributes** = Length, cross-sectional area, tortuosity, orientation
 
 ### Key Terminology
 
 | Term | Definition |
 |------|------------|
 | **Vessel segment** | A continuous tube between two junction points |
-| **Junction** | Where vessels meet or bifurcate (node degree > 2) |
-| **Endpoint/Sprout tip** | Terminal point of a vessel (node degree = 1) |
+| **Junction** | Where vessels meet or bifurcate (node degree ≥ 3) |
+| **Endpoint/Sprout tip** | Terminal point of a vessel (node degree = 1 in the skeleton graph before pruning) |
 | **Sprout** | Vessel segment connected to an endpoint |
 | **Branch** | Vessel segment between two junctions |
 | **Tortuosity** | Path length / straight-line distance (≥1, higher = more curved) |
-| **EDT** | Euclidean Distance Transform - distance to nearest boundary |
+| **Chip volume** | Convex-hull volume of the vessel mask inside the border margins; the reference volume of the density metrics |
+| **EDT** | Euclidean Distance Transform: distance to nearest boundary |
 
 ## 1.4 System Requirements
 
 | Component | Minimum | Recommended |
 |-----------|---------|-------------|
-| Python | 3.9 | 3.10+ |
+| Python | 3.9 | 3.9 (tested) |
 | GPU | 8GB VRAM | 16GB+ VRAM |
 | RAM | 16GB | 32GB+ |
 | CUDA | 11.x | 12.x |
@@ -173,24 +179,26 @@ cd VascuMap3D
 pip install -r requirements.txt
 ```
 
+The requirements were tested with Python 3.9, PyTorch 2.8 and CUDA 12.8. Because `requirements.txt` installs `cupy-cuda12x`, a different CUDA toolkit requires the matching CuPy wheel (`cupy-cuda11x` or `cupy-cuda13x`) instead. The packages `tables` (HDF5 output of the per-vessel and per-junction tables) and `nd2` (Nikon `.nd2` input through aicsimageio) are also listed there.
+
 ---
 
 # 2. Detailed Workflow
 
 ## 2.1 Training
 
-> **Note for beginners:** This section explains how to train the deep learning models. If you're new to deep learning, don't worry - we'll explain the key concepts along the way. Training requires a GPU with at least 8GB of memory.
+> **Note for beginners:** This section explains how to train the deep learning models. Readers new to deep learning will find the key concepts explained along the way. Training requires a GPU with at least 8 GB of memory.
 
 ### 2.1.1 Image Translation (3D Pix2Pix)
 
 #### What is Image Translation?
 
-Image translation is like teaching a computer to "translate" one type of image into another - similar to how Google Translate converts English to French. In our case:
+Image translation teaches a network to "translate" one type of image into another, much as machine translation converts English into French. In our case:
 
 - **Input**: Brightfield microscopy (low contrast, vessels hard to see)
 - **Output**: Fluorescence-like image (high contrast, vessels clearly visible)
 
-The model learns this translation by looking at many paired examples: "here's a brightfield image, and here's what the same sample looks like in fluorescence."
+The model learns this translation from many paired examples, each made of a brightfield image and the fluorescence image of the same sample.
 
 #### How Does Pix2Pix Work?
 
@@ -231,7 +239,7 @@ Pix2Pix is a type of **Generative Adversarial Network (GAN)** - a clever trainin
 #### Why 3D?
 
 Unlike standard Pix2Pix which works on 2D images, we use **3D convolutions** because:
-- Vessels are 3D structures - context from adjacent Z-slices helps
+- Vessels are 3D structures, so context from adjacent Z-slices helps
 - Maintains spatial coherence across the Z-stack
 - Better handles vessels that are tilted or curved through the volume
 
@@ -251,7 +259,7 @@ The factor of 100 (λ) gives more weight to matching the actual image than just 
 
 #### Input Data Format
 
-You need **paired** 3D volumes - each brightfield volume must have a corresponding fluorescence volume:
+Training requires **paired** 3D volumes: each brightfield volume must have a corresponding fluorescence volume:
 
 ```
 /data/
@@ -307,10 +315,17 @@ python -m vascumap.models.image_translation.train \
 
 | Parameter | Default | What it Does | Recommendations |
 |-----------|---------|--------------|-----------------|
-| `batch_size` | 4 | Samples per training step | Lower if out of memory |
+| `batch_size` | 4 | Samples per training step | 4 to 6 only (see note below) |
 | `epochs` | 200 | Full passes through dataset | More epochs = longer training |
-| `generator_lr` | 1e-3 | Generator learning rate | Don't change unless needed |
-| `discriminator_lr` | 1e-6 | Discriminator learning rate | Much lower than generator |
+| `generator_lr` | 1e-3 | Generator learning rate | Change only if needed |
+| `discriminator_lr` | 1e-5 | Discriminator learning rate | Much lower than generator |
+| `generator_dropout` | 0.1 | Dropout in the generator U-Net | - |
+| `discriminator_dropout` | 0.25 | Passed to the discriminator, whose layers contain no dropout | - |
+| `val_split` | 0.1 | Fraction of volumes held out for validation | - |
+| `num_workers` | 0 | DataLoader worker processes | - |
+| `device` | `cuda` | Device for the architecture summaries | - |
+
+**Note on batch size:** `Pix2Pix.training_step` splits every training batch into a discriminator half and a generator half of at most three volumes each (`TRAIN_BATCH_SIZE=6`), and the training loader drops incomplete batches. Consequently, a batch size between 4 and 6 is required, because a smaller batch yields a single half and a larger batch yields more than two.
 
 **Key functions:** [`ImageDataset3D`](#imagedataset3d), [`Generator`](#generator), [`Discriminator`](#discriminator), [`Pix2Pix`](#pix2pix)
 
@@ -336,9 +351,9 @@ Then open `http://localhost:6006` in your browser.
 | `val_d_accuracy` | Discriminator correctness | ~50% | 0% or 100% |
 
 **What "50% discriminator accuracy" means:**
-- If the discriminator is too good (accuracy > 90%), the generator can't learn
+- If the discriminator is too good (accuracy > 90%), the generator cannot learn
 - If the discriminator is too bad (accuracy < 10%), the generator has no guidance
-- 50% means they're evenly matched - ideal for learning
+- 50% means they are evenly matched, which is ideal for learning
 
 **Common problems and solutions:**
 
@@ -347,7 +362,7 @@ Then open `http://localhost:6006` in your browser.
 | Mode collapse | Generator produces same output for all inputs | Lower learning rates, add dropout |
 | Discriminator wins | D accuracy > 90%, G loss not decreasing | Reduce discriminator_lr |
 | Generator wins | D accuracy < 10%, images look blurry | Increase discriminator_lr |
-| Out of memory | CUDA out of memory error | Reduce batch_size |
+| Out of memory | CUDA out of memory error | Reduce batch_size (minimum 4) or the volume size |
 
 #### When is Training Done?
 
@@ -356,7 +371,7 @@ Training is complete when:
 2. **val_g_ssim** stabilizes above 0.5
 3. Visual inspection shows good quality images
 
-The best model checkpoint is automatically saved based on validation SSIM.
+Validation runs twice per epoch, and the five checkpoints with the highest validation structural similarity (`val_g_ssim`) are kept in the model directory as `{epoch}-{val_g_psnr}-{val_g_ssim}.ckpt`. At the end of training, the final weights are also written as a bare state dictionary to `last_epoch_full.pth`. Since [`load_pix2pix`](#load_pix2pix) reads the `state_dict` entry of a Lightning checkpoint, inference requires one of the `.ckpt` files.
 
 ---
 
@@ -450,6 +465,8 @@ The "model" is the overall structure (U-Net is most common):
 
 **For vessel segmentation, we recommend: `Unet` + `mit_b5`**
 
+The inference pipeline depends on this choice: [`load_segmentation_model`](#load_segmentation_model) always rebuilds a `Unet` with an `mit_b5` encoder and a one-channel input, so a model trained with another architecture or encoder can only be used for inference after the corresponding change in `vascumap/pipeline/prediction.py`.
+
 #### Loss Functions Explained
 
 We use two losses that complement each other:
@@ -482,10 +499,10 @@ You need paired images and masks:
 | Property | Requirement | Why |
 |----------|-------------|-----|
 | Format | TIFF (`.tif`) | Preserves quality, no compression artifacts |
-| Dimensions | 256 × 256 pixels | Balance of detail and memory usage |
+| Dimensions | 256 × 256 pixels | Balance of detail and memory usage; also the tile size used at inference |
 | Channels | 1 (grayscale) | Microscopy is typically grayscale |
-| Values | Float32, range [0, 1] | Normalized for neural network |
-| Preprocessing | Contrast-adjusted | Standardizes intensity range |
+| Values | Raw intensities accepted | Normalized on loading (see below) |
+| Preprocessing | Done by the dataset | Each tile is clipped to its 0.1st–99.9th percentiles, rescaled to [0, 1] and cast to float32 |
 
 **Mask requirements:**
 
@@ -493,40 +510,45 @@ You need paired images and masks:
 |----------|-------------|-----|
 | Format | Same as images | Consistency |
 | Dimensions | Same as corresponding image | Must align pixel-by-pixel |
-| Values | Binary: 0.0 or 1.0 | Background vs vessel |
-| Data type | Float32 | Matches image format |
+| Values | Any value > 0 is vessel; 0 and NaN are background | Binarized on loading |
+| Data type | Any numeric type | Converted to integer labels by the dataset |
+
+Images and masks are paired by their position in the sorted file lists, so identical file names in the two folders guarantee correct pairing. A random 10% of the pairs (`test_size=0.1`, `seed=0`) is held out for validation.
 
 #### Preparing Training Data
 
 **Step 1: Extract 2D crops from your 3D volumes**
 
 ```python
+import os
 import tifffile
 import numpy as np
-from vascumap.pipeline.utils import contrast, scale
 
 # Load your 3D stack
 stack = tifffile.imread('volume.tif')  # Shape: (Z, Y, X)
 mask_3d = tifffile.imread('mask.tif')
 
-# Extract 256×256 crops from each Z-slice
+os.makedirs('images', exist_ok=True)
+os.makedirs('masks', exist_ok=True)
+
+# Extract non-overlapping 256×256 crops from each Z-slice
 crop_size = 256
+_, ny, nx = stack.shape
 for z in range(stack.shape[0]):
-    for i, (y, x) in enumerate(get_crop_positions(stack.shape[1:], crop_size)):
-        # Extract image crop
-        img_crop = stack[z, y:y+crop_size, x:x+crop_size]
-        
-        # Preprocess: contrast adjustment + normalization
-        img_crop = contrast(img_crop, 1, 99)  # Clip to 1st-99th percentile
-        img_crop = scale(img_crop)             # Normalize to [0, 1]
-        
-        # Extract corresponding mask crop
-        mask_crop = mask_3d[z, y:y+crop_size, x:x+crop_size]
-        mask_crop = (mask_crop > 0).astype(np.float32)  # Ensure binary
-        
-        # Save
-        tifffile.imwrite(f'images/z{z:03d}_crop{i:03d}.tif', img_crop.astype(np.float32))
-        tifffile.imwrite(f'masks/z{z:03d}_crop{i:03d}.tif', mask_crop)
+    i = 0
+    for y in range(0, ny - crop_size + 1, crop_size):
+        for x in range(0, nx - crop_size + 1, crop_size):
+            # Image crop: no normalization needed, SegmentationDataset clips each tile
+            # to its 0.1-99.9th percentiles and rescales it to [0, 1] on loading
+            img_crop = stack[z, y:y+crop_size, x:x+crop_size].astype(np.float32)
+
+            # Corresponding mask crop
+            mask_crop = (mask_3d[z, y:y+crop_size, x:x+crop_size] > 0).astype(np.float32)
+
+            # Save
+            tifffile.imwrite(f'images/z{z:03d}_crop{i:03d}.tif', img_crop)
+            tifffile.imwrite(f'masks/z{z:03d}_crop{i:03d}.tif', mask_crop)
+            i += 1
 ```
 
 **Step 2: Verify your data**
@@ -537,31 +559,47 @@ img = tifffile.imread('images/z000_crop000.tif')
 mask = tifffile.imread('masks/z000_crop000.tif')
 
 print(f"Image shape: {img.shape}")        # Should be (256, 256)
-print(f"Image range: [{img.min():.2f}, {img.max():.2f}]")  # Should be ~[0, 1]
+print(f"Image range: [{img.min():.2f}, {img.max():.2f}]")  # Any range; rescaled on loading
 print(f"Mask unique values: {np.unique(mask)}")  # Should be [0, 1]
 ```
 
-**Key functions:** [`contrast`](#contrast), [`scale`](#scale)
+**Key function:** [`SegmentationDataset`](#segmentationdataset)
 
 #### Handling Grayscale with Pretrained Weights
 
 Most pretrained encoders expect 3-channel RGB images. Our microscopy is 1-channel grayscale. The code automatically adapts the first layer:
 
 ```python
-# Original first layer: Conv2d(3, 64, kernel_size=7)
+# Original first layer (MiT patch embedding): Conv2d(3, 64, kernel_size=7, stride=4)
 #   - Expects 3 input channels (R, G, B)
 #   - Each channel has its own weights
 
-# Adapted layer: Conv2d(1, 64, kernel_size=7)
+# Adapted layer: Conv2d(1, 64, kernel_size=7, stride=4)
 #   - Accepts 1 input channel (grayscale)
 #   - Weights = sum of original RGB weights
 
-# This is done automatically by adapt_input_model()
+# For MiT encoders this is done automatically by adapt_input_model(),
+# called by build_model() when in_channels=1
 ```
+
+For the other encoders, `segmentation_models_pytorch` performs the same weight summation itself when the model is built with `in_channels=1`.
 
 **Why summing works:** The RGB weights learned complementary features. Summing them creates a reasonable grayscale feature extractor.
 
 **Key function:** [`adapt_input_model`](#adapt_input_model)
+
+#### Data Augmentation
+
+Training tiles are augmented on the fly with albumentations (version 2.0 or later), whereas validation tiles are only converted to tensors:
+
+| Transform | Parameters | Probability |
+|-----------|------------|-------------|
+| `HorizontalFlip` | - | 0.5 |
+| `VerticalFlip` | - | 0.5 |
+| `Affine` | translation ±6.25%, scale 0.9–1.1, rotation ±45°, mirrored border | 0.5 |
+| `ToTensorV2` | conversion to a PyTorch tensor | always |
+
+**Key functions:** [`hard_transforms`](#hard_transforms), [`load_data`](#load_data)
 
 #### Training Command
 
@@ -593,8 +631,8 @@ python -m vascumap.models.segmentation.training \
 | `--weights` | `imagenet` | Pretrained weights | Always use `imagenet` |
 | `--epochs` | `200` | Training iterations | 100-300 depending on dataset |
 | `--batch_size` | `16` | Samples per step | Reduce if out of memory |
-| `--learning_rate` | `1e-3` | Step size for optimization | Don't change unless needed |
-| `--fp16` | `False` | Use half precision | Add flag to save memory |
+| `--learning_rate` | `1e-3` | Step size for optimization | Change only if needed |
+| `--fp16` | `False` | Use 16-bit mixed precision (`precision="16-mixed"`) | Add flag to save memory |
 
 **Key functions:** [`SegmentationModule`](#segmentationmodule), [`build_model`](#build_model), [`load_data`](#load_data)
 
@@ -610,6 +648,8 @@ The training logs show these metrics:
 | `val_dice` | Dice on validation data | > 0.7 | < 0.5 |
 | `train_iou` | Intersection over Union | Increasing toward 1.0 | Stuck low |
 | `val_iou` | IoU on validation data | > 0.6 | < 0.4 |
+
+For a binary mask, the Dice coefficient equals the F1 score; the Dice metrics are therefore computed with torchmetrics `BinaryF1Score`, and IoU with the binary `JaccardIndex`, both on sigmoid probabilities thresholded at 0.5. `train_loss` is logged at every step, whereas the Dice and IoU values are averaged over each epoch.
 
 **Understanding Dice and IoU:**
 
@@ -640,7 +680,7 @@ This helps fine-tune the model after initial learning.
 2. Validation loss has stopped improving for 20+ epochs
 3. Visual inspection shows good segmentations
 
-Best checkpoint is automatically saved based on lowest `val_loss`.
+The three checkpoints with the lowest `val_loss` are kept in the model directory as `{epoch}-{val_loss}-{val_dice}.ckpt`, and the learning rate is logged once per epoch. For a `Unet` with an `mit_b5` encoder, these Lightning checkpoints can be passed directly to the inference pipeline.
 
 ---
 
@@ -648,7 +688,7 @@ Best checkpoint is automatically saved based on lowest `val_loss`.
 
 ### 2.2.1 Data Loading & Voxel Normalization
 
-The pipeline reads Leica LIF files and normalizes voxel sizes:
+The pipeline reads microscopy files and normalizes voxel sizes. Brightfield input is read from Leica LIF files with readlif, all channels included:
 
 ```python
 from vascumap.pipeline.data import get_stack_from_lif
@@ -661,19 +701,36 @@ stack, voxel_size, [nz, ny, nx] = get_stack_from_lif(
 # Returns: (Z, Y, X, C) array, rescaled to reference voxel size
 ```
 
-**What happens internally:**
-1. Read voxel size from LIF metadata
-2. Calculate rescale factors: `original_voxel / ref_voxel`
-3. Resample volume using cubic interpolation
-4. Validate Z-range ≥ 160 µm
+When a fluorescence vessel channel is segmented directly, any format readable by aicsimageio (for example `.nd2`, `.czi` or `.lif`) is read scene by scene, and only the requested channel is returned:
 
-**Key function:** [`get_stack_from_lif`](#get_stack_from_lif)
+```python
+from aicsimageio import AICSImage
+from vascumap.pipeline.data import get_stack_from_aics
+
+img = AICSImage('sample.nd2')
+img.set_scene(img.scenes[0])     # the scene must be selected by the caller
+
+stack, voxel_size, [nz, ny, nx] = get_stack_from_aics(
+    img,
+    channel_index=1,             # e.g. the GFP channel
+    ref_voxel_size=[5, 2, 2]
+)
+# Returns: (Z, Y, X, 1) array, rescaled to reference voxel size
+```
+
+**What happens internally:**
+1. Read voxel size from the file metadata (LIF scale, or the aicsimageio physical pixel sizes, which must be present)
+2. Validate Z-range ≥ 160 µm (a `ValueError` is raised otherwise)
+3. Calculate rescale factors: `original_voxel / ref_voxel`
+4. Resample volume using cubic interpolation
+
+**Key functions:** [`get_stack_from_lif`](#get_stack_from_lif), [`get_stack_from_aics`](#get_stack_from_aics)
 
 ---
 
 ### 2.2.2 Preprocessing & Cropping
 
-The cropping pipeline solves all three challenges through four stages:
+The cropping pipeline extracts the region of interest (ROI) of each stack in four stages:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -784,6 +841,8 @@ focused_image, height_map = auto_focus(
 | `n_sampling` | Grid density | 5-20 | More = slower but more accurate |
 | `window_size` | Patch size for focus | 50-100 | Larger = more robust to noise |
 
+Within [`crop_stack`](#crop_stack), `auto_focus` is called with `crop_window` set to 20% of the stack width (at least 200 pixels), `n_sampling=5` and `window_size=400`.
+
 **Key function:** [`auto_focus`](#auto_focus)
 
 ---
@@ -814,8 +873,11 @@ Original:                    After Sobel:
 **Processing Steps:**
 
 ```python
+# 0. Clip to the 0.1-99.9th percentiles and rescale to [0, 1]
+im = scale(contrast(focused_image, 0.1, 99.9))
+
 # 1. Downsample for speed (10% of original size)
-im_r = rescale(focused_image, 0.1)
+im_r = rescale(im, 0.1)
 
 # 2. Compute Sobel gradients in both directions
 edges_x = sobel_h(im_r)  # Horizontal edges
@@ -824,7 +886,8 @@ edges_y = sobel_v(im_r)  # Vertical edges
 # 3. Combine into gradient magnitude
 edges = sqrt(edges_x² + edges_y²)
 
-# 4. Smooth to reduce noise
+# 4. Smooth to reduce noise (after trimming a 3-pixel border and
+#    edge-padding the rows, which limits border artifacts)
 edges = gaussian(edges, sigma=2.5)
 
 # 5. Threshold high values (removes noise)
@@ -843,7 +906,7 @@ We have edges showing the sample boundary. We need to figure out exactly where t
 
 **What is a Template?**
 
-A template consists of two files:
+A template consists of two files, stored in the crop profile folder (`profile_dir` of `crop_stack`, `--crop_profile_dir` on the command line; default `crop_profiles`, relative to the working directory):
 
 ```
 crop_profiles/
@@ -854,6 +917,8 @@ crop_profiles/
 **Fiducials:** Points along the sample boundary that we expect to see in every image.
 **Rectangle:** The four corners of the region we want to extract.
 
+If either file is missing, `crop_stack` raises a `FileNotFoundError` that names both expected paths.
+
 
 **The Registration Process:**
 
@@ -861,10 +926,10 @@ We find the transformation (scale, rotation, translation) that best aligns the t
 
 ```
 Transformation Parameters:
-  - scale: How much to resize the template (usually ~1.0)
-  - theta: Rotation angle in radians
-  - tx: Translation in X
-  - ty: Translation in Y
+  - scale: How much to resize the template (bounded to 0.999-1.001, i.e. fixed at ~1.0)
+  - theta: Rotation angle in radians (bounded to ±1.5)
+  - tx: Translation added to the first (y) coordinate column (bounded to ±500 pixels)
+  - ty: Translation added to the second (x) coordinate column (bounded to ±500 pixels)
 
 Mathematical formulation:
   
@@ -882,14 +947,20 @@ Finding the best transformation is an optimization problem. We use a two-stage a
 Stage 1: BASIN-HOPPING (Global Search)
 ────────────────────────────────────────
 Problem: The objective function has many local minima.
-Solution: Try many random starting points, do local optimization from each.
+Solution: Start from three points (the template centered on the image and two
+perturbed variants). From each, make 50 random hops (scale ±0.1, rotation
+±0.1 rad, translation ±20 pixels; hops outside the bounds are rejected), each
+followed by a bounded Powell local optimization.
 
 
 Stage 2: POWELL (Local Refinement)
 ──────────────────────────────────
-Take the best result from basin-hopping and refine it further.
+Refine each basin-hopping result with Powell (up to 2000 iterations) and keep
+the lowest score over the three starting points.
 Powell method: Optimizes one parameter at a time, then repeats.
 ```
+
+Because the scale is effectively fixed, the template must be drawn at the pixel size of the stacks it is registered to (2 µm in XY after resampling to the reference voxel size).
 
 **The Objective Function:**
 
@@ -909,13 +980,18 @@ def objective_function(params, template_coords, edge_image):
     
     # Penalize heavily if too many points are outside
     if valid_ratio < 0.9:
-        return large_penalty  # Bad transformation
+        return 1e6 * (0.9 - valid_ratio)  # Bad transformation
     
     # Sample edge values at transformed points
     edge_responses = edge_image[transformed_y, transformed_x]
     
+    # Weighted mean: points on a non-zero edge count 1.1, the others 1.0
+    weights = where(edge_responses > 0, 1.1, 1.0)
+    weighted_avg = sum(edge_responses * weights) / sum(weights)
+    
     # Good alignment = high edge values = low cost
-    return -mean(edge_responses)
+    penalty_factor = 1.0 - (valid_ratio - 0.9)
+    return -(weighted_avg * valid_ratio) * (1 + penalty_factor)
 ```
 
 **Key functions:** [`register_high_level`](#register_high_level), [`transform_coords`](#transform_coords), [`objective_function`](#objective_function), [`register_neck_coords_advanced`](#register_neck_coords_advanced)
@@ -932,19 +1008,22 @@ We now know where the ROI is (transformed rectangle coordinates). We need to ext
 1. **Z-Cropping:** Extract a slab of the right thickness, following the curved surface
 2. **XY-Cropping:** Extract the (possibly rotated) quadrilateral and warp it to a rectangle
 
-**Z-Cropping - Following the Surface:**
+**Z-Cropping: Following the Surface**
 
 The height map from Stage 1 tells us where the surface is. We extract a slab centered on this surface:
 
 
 ```python
+# z_range (µm) is converted to planes: z_range_px = round(z_range / ref_voxel_size[0])
 # For each (y, x), we extract Z slices from:
-#   grid[y, x] - z_range/2  to  grid[y, x] + z_range/2
+#   grid[y, x] - z_range_px/2  to  grid[y, x] + z_range_px/2
 # 
-# This creates a "slab" that follows the curved surface
+# This creates a "slab" that follows the curved surface. Where the slab would
+# leave the stack, it is shifted back inside; if z_range exceeds the stack,
+# the whole stack is kept (stacks of fewer than 32 planes raise an error).
 ```
 
-**XY-Cropping - Warping the Quadrilateral:**
+**XY-Cropping: Warping the Quadrilateral**
 
 The ROI is defined by 4 corners which may form a non-axis-aligned quadrilateral.
 
@@ -954,15 +1033,18 @@ from vascumap.pipeline.preprocessing import crop_stack
 
 cropped = crop_stack(
     stack,                      # Input: (Z, Y, X, C)
-    crop_profile='dorota',      # Template name
+    crop_profile='myprofile',   # Template name
     bf_index=0,                 # Which channel to use for registration
     mode='3D',                  # '3D' extracts a slab; '2D' extracts single slice
     z_range=200,                # Thickness in µm
     ref_voxel_size=[5, 2, 2],   # Voxel size for Z-range conversion
     lif_path_root='/output',    # Save debug images here
-    filename='sample1'          # Prefix for debug images
+    filename='sample1',         # Prefix for debug images
+    profile_dir='crop_profiles' # Folder holding the template files
 )
 ```
+
+The quadrilateral is mapped onto a rectangle by an affine transform estimated from its four corners and resampled with cubic interpolation (`order=3`), plane by plane.
 
 **Key functions:** [`crop_stack`](#crop_stack), [`crop_stack_z`](#crop_stack_z), [`apply_affine_crop_simple`](#apply_affine_crop_simple)
 
@@ -970,15 +1052,17 @@ cropped = crop_stack(
 
 #### Creating Custom Crop Profiles
 
-To use the cropping pipeline with your own sample type, you need to create a template.
+To use the cropping pipeline with your own sample type, you need to create a template. The notebook `notebooks/new_crop_profile.ipynb` implements the steps below interactively, with the fiducials and the rectangle drawn as Shapes layers in napari (an optional dependency, listed as a comment in `requirements.txt`).
 
 **Step 1: Get a Representative Image**
 
 ```python
+from vascumap.pipeline.data import get_stack_from_lif
 from vascumap.pipeline.preprocessing import auto_focus
 
-# Load a typical sample
-stack = ...  # Your 3D stack
+# Load a typical sample at the reference voxel size (5 × 2 × 2 µm),
+# the resolution at which crop_stack registers the template
+stack, _, _ = get_stack_from_lif('reference.lif', stack_index=0)
 
 # Get a focused 2D image
 focused_image, _ = auto_focus(stack[..., 0])  # Use brightfield channel
@@ -1050,20 +1134,21 @@ cropped = crop_stack(
     mode='3D',
     z_range=200,
     lif_path_root='./debug',  # Check the debug images!
-    filename='test'
+    filename='test',
+    profile_dir='crop_profiles'
 )
 ```
 
-Check the saved `*_crop_overview.png` to see if registration worked correctly.
+Check the saved `test_crop_overview.png` (written only when both `lif_path_root` and `filename` are given) to see if registration worked correctly.
 
 **Common Issues and Solutions:**
 
 | Problem | Symptom | Solution |
 |---------|---------|----------|
-| Template too large | Points go outside image | Scale down template coordinates |
+| Template too large | Points go outside image | Scale down template coordinates (the registration keeps the scale at ~1.0) |
 | Not enough fiducials | Poor alignment | Add more fiducial points |
 | Fiducials on variable features | Inconsistent alignment | Move fiducials to stable boundaries |
-| Optimization stuck | Bad crop location | Try different initial parameters |
+| Optimization stuck | Bad crop location | Call `register_neck_coords_advanced` directly with closer `initial_params` |
 
 ---
 
@@ -1080,14 +1165,18 @@ pseudo_fluo = predict_pix2pix(
     model,
     stack_bf,           # (Z, Y, X)
     device='cuda',
-    n_iter=1            # Monte Carlo averaging (for dropout uncertainty)
+    n_iter=1            # Number of passes averaged
 )
 ```
 
 **Inference details:**
 - Uses MONAI SlidingWindowInferer
-- ROI size: 32×512×512, overlap: 75%/25%/25%
+- ROI size: 32×512×512, overlap: 75%/25%/25%, one window per batch
+- Runs under automatic mixed precision (`torch.amp.autocast`)
 - Output clipped to [0, 1]
+- `load_pix2pix` returns the model in eval mode, so dropout is inactive and `n_iter > 1` averages identical passes
+
+When the pipeline segments a fluorescence channel directly (`fluo_channel` or `fluo_index`), this step and the Pix2Pix checkpoint are skipped.
 
 **Key functions:** [`load_pix2pix`](#load_pix2pix), [`predict_pix2pix`](#predict_pix2pix)
 
@@ -1100,7 +1189,7 @@ Run the segmentation model using **2.5D inference** - predictions along three or
 ```python
 from vascumap.pipeline.prediction import load_segmentation_model, predict_mask_ortho
 
-model = load_segmentation_model('segmentation.ckpt')
+model = load_segmentation_model('segmentation.ckpt')   # Lightning .ckpt or .pth
 
 probability_map = predict_mask_ortho(
     model,
@@ -1110,10 +1199,14 @@ probability_map = predict_mask_ortho(
 ```
 
 **2.5D approach:**
-1. **Axial** (XY slices): Primary view, full resolution
-2. **Coronal** (XZ slices): Side view, 256×256 patches
-3. **Sagittal** (YZ slices): Front view, 256×256 patches
+1. **Axial** (XY slices): Primary view, 256×256 tiles
+2. **Coronal** (XZ slices): Side view, 256×256 tiles
+3. **Sagittal** (YZ slices): Front view, 256×256 tiles
 4. **Average**: Final probability = mean of all three
+
+Each plane is tiled by MONAI `SliceInferer` with the training tile size (256×256), 50% overlap, Gaussian blending and batches of 32 tiles. For the coronal and sagittal passes, volumes with fewer than 256 planes in Z are padded with -1 to 256 planes, and the padding is removed from the predictions before averaging.
+
+`load_segmentation_model` accepts a PyTorch Lightning checkpoint (`.ckpt`, whose weights are stored under the `model.` prefix), an exported `.pth` holding a `model_state_dict` entry, or a bare state dictionary. The weights are loaded non-strictly, and any missing or unexpected keys are reported instead of raising an error.
 
 **Post-processing:**
 ```python
@@ -1123,23 +1216,63 @@ binary_mask = process_vessel_mask(probability_map, ortho=True)
 # Applies: median filter (size=7) + hysteresis threshold (0.2, 0.5)
 ```
 
+With `ortho=False` (`--no_ortho`), only the axial plane is segmented ([`predict_mask`](#predict_mask), batches of 16 tiles) on the anisotropic 5 × 2 × 2 µm stack, after clipping the input to [0.05, 1] and rescaling it. The probability map is then thresholded by hysteresis (0.1, 0.5) without median filtering, and the mask is resampled to the isotropic grid.
+
 **Key functions:** [`load_segmentation_model`](#load_segmentation_model), [`predict_mask_ortho`](#predict_mask_ortho), [`predict_mask`](#predict_mask), [`process_vessel_mask`](#process_vessel_mask)
 
 ---
 
 ### Full Pipeline Command
 
+Brightfield input (Pix2Pix translation, then segmentation):
+
 ```bash
 python -m vascumap.pipeline.main \
-    --lif_dir_path /path/to/lif/files \
+    --input_dir /path/to/lif/files \
     --model_p2p_path /path/to/translation.ckpt \
     --model_smp_path /path/to/segmentation.ckpt
 ```
 
-**Output files (per sample):**
-- `*_vessel_mask.tif`: Binary segmentation
-- `*_overview.png`: Visual comparison
-- `*_crop_overview.png`: Registration debug (if cropping)
+Fluorescence input (for example the green fluorescent protein (GFP) channel of `.nd2` files, read with aicsimageio; Pix2Pix is skipped):
+
+```bash
+python -m vascumap.pipeline.main \
+    --input_dir /path/to/nd2/files \
+    --pattern "*.nd2" \
+    --fluo_channel GFP \
+    --model_smp_path /path/to/segmentation.ckpt
+```
+
+**All parameters explained:**
+
+| Parameter | Default | What it Does |
+|-----------|---------|--------------|
+| `--input_dir` (alias `--lif_dir_path`) | Required | Folder with the microscopy files |
+| `--pattern` | `*.lif` | Glob pattern of the files to process, e.g. `*.nd2` |
+| `--model_p2p_path` | `None` | Pix2Pix checkpoint; required for brightfield input |
+| `--model_smp_path` | Required | Segmentation checkpoint (`.ckpt` or `.pth`) |
+| `--fluo_channel` | `None` | Name (case-insensitive substring) of a fluorescence vessel channel; skips Pix2Pix |
+| `--fluo_index` | `None` | Index of a fluorescence vessel channel; skips Pix2Pix |
+| `--bf_index` | `None` | Brightfield channel index; if omitted, the first channel whose name contains `BF` or `Gray` (case-insensitive), else channel 0 |
+| `--no_crop` | off | Skip auto-focus and template cropping |
+| `--crop_profile` | None | Name of the crop profile (required unless `--no_crop`) |
+| `--crop_profile_dir` | `crop_profiles` | Folder holding the crop profiles |
+| `--z_range` | `200` | Z-range (µm) kept around the focal surface when cropping |
+| `--no_ortho` | off | Axial-only segmentation instead of 2.5D averaging |
+| `--save_all_stacks` | off | Also save the intermediate stacks |
+
+No crop profile is distributed with the repository (`crop_profiles/` is excluded by `.gitignore`). Cropping is on by default, so a profile created as described in [Creating Custom Crop Profiles](#creating-custom-crop-profiles) must be passed with `--crop_profile` (and `--crop_profile_dir`); otherwise `run()` stops with an error before any stack is processed, unless `--no_crop` is set. A stack whose cropping fails is skipped.
+
+Without `--fluo_channel` or `--fluo_index`, LIF files are read with readlif, and every image with exactly three dimensions (X, Y and Z) is processed. With either option, every scene of every matching file is read with aicsimageio, and scenes without a matching channel or with a single Z-plane are skipped. In that case, the stack has a single channel, so auto-focus and template registration also run on the fluorescence image; `--no_crop` avoids this when the crop profile was drawn on brightfield images. Model inference runs on the GPU when CUDA is available and otherwise on the CPU, whereas the median filter of the 2.5D post-processing relies on CuPy and therefore always requires a GPU.
+
+**Output files (per stack, written next to the input files):**
+
+`<stack>` is the file name without extension followed by the LIF image name or the scene identifier, with spaces and slashes replaced by underscores. A stack whose `<stack>_vessel_mask.tif` already exists is skipped.
+
+- `<stack>_vessel_mask.tif`: Binary segmentation (float32, isotropic 2 µm voxels)
+- `<stack>_overview.png`: Z-sum projections of the fluorescence channel (or of the brightfield when the stack has no other channel), the probability map and the mask, side by side
+- `<stack>_crop_overview.png`: Registration debug (if cropping)
+- With `--save_all_stacks`, also on the isotropic grid: `<stack>_vessel_bf.tif` (the input channel, which is the fluorescence channel in fluorescence mode), `<stack>_vessel_pred.tif` (the volume passed to segmentation), `<stack>_vessel_proba.tif` (probability map) and `<stack>_vessel_fluo.tif` (the fluorescence channel; for multi-channel brightfield input, the first channel other than the brightfield)
 
 **Key function:** [`run`](#run)
 
@@ -1149,7 +1282,7 @@ python -m vascumap.pipeline.main \
 
 ### 2.3.1 Skeletonization
 
-Convert binary mask to 1-pixel-wide skeleton. Two methods available:
+Convert binary mask to 1-pixel-wide skeleton. Two methods available, both applied after the holes of the mask have been filled (`binary_fill_holes`, run on the GPU in chunks of Z × 512 × 512 voxels with a 128-voxel overlap; the mask is not smoothed beforehand):
 
 #### Method 1: Morphological Thinning
 
@@ -1160,11 +1293,14 @@ from vascumap.pipeline.skeletonization import skeletonize_3d_parallel
 
 skeleton = skeletonize_3d_parallel(
     binary_mask,
-    chunk_size=(128, 128, 128)
+    chunk_size=(512, 512, 512),
+    overlap=128          # voxels; must exceed the largest vessel radius
 )
 ```
 
-**Best for:** Dense networks (vessel coverage > 30%)
+Chunks are skeletonized in parallel with Dask, each with a halo of `overlap` voxels on every side (clamped to the volume and chunk size along each axis), because thinning is not a local operation and too small an overlap corrupts thick vessels near chunk seams. [`construct_vessel_network`](#construct_vessel_network) uses chunks of Z × 512 × 512 voxels with the same 128-voxel overlap.
+
+**Best for:** Dense networks (vessel volume fraction > 0.3, the threshold used by `skel_method="auto"`)
 
 **Key function:** [`skeletonize_3d_parallel`](#skeletonize_3d_parallel)
 
@@ -1182,9 +1318,12 @@ graph, mesh, simple_mesh, contracted = create_graph_contraction(
 ```
 
 **Algorithm:**
-1. Generate surface mesh (Marching Cubes)
-2. Iteratively contract toward centerline
-3. Extract skeleton from contracted mesh
+1. Generate surface mesh (Marching Cubes) and simplify it (quadric decimation)
+2. Iteratively contract toward centerline on the GPU ([`contract_gpu`](#contract_gpu))
+3. Simplify and repair the contracted mesh
+4. Extract skeleton from contracted mesh (PyGEL3D) and convert it to a NetworkX graph, removing terminal nodes attached to nodes of degree > 6
+
+Within [`construct_vessel_network`](#construct_vessel_network), the graph nodes are then moved toward the vessel centerline along the gradient of the smoothed EDT ([`reposition_graph_edges`](#reposition_graph_edges), at most 10 voxels), and [`finalize_graph`](#finalize_graph) merges degree-2 nodes and rasterizes the edges. The pruning steps of Section 2.3.2 apply to the thinning method only, whereas border trimming applies to both methods.
 
 **Best for:** Sparse networks, varying vessel diameters
 
@@ -1199,26 +1338,65 @@ Convert skeleton to NetworkX graph:
 ```python
 import sknw
 
-# Build graph from skeleton
-graph = sknw.build_sknw(skeleton_image)
+# Build graph from skeleton (as called by construct_vessel_network)
+graph = sknw.build_sknw(skeleton_image, multi=False, iso=False, ring=False)
 
 # Nodes have 'pts' attribute (coordinates)
-# Edges have 'pts' attribute (path coordinates)
+# Edges have 'pts' attribute (path coordinates) and 'weight' (path length in voxels)
 ```
 
-**Post-processing:**
-1. **Pruning**: Remove spurious branches based on length/EDT ratio
-2. **Merge degree-2 nodes**: Simplify graph
-3. **Border trimming**: Remove edges near image boundaries
+Each node keeps its full voxel set in `pts_all`, while `pts` is reduced to one representative voxel, and every node of degree 1 is flagged as a sprout tip (`sprout=True`). This flag is not updated afterwards, so a junction that loses branches during pruning or border trimming is not relabeled as a sprout tip.
+
+**Post-processing** (thinning method, in this order):
+1. **Tip/origin area pruning** ([`prune_graph`](#prune_graph)): Remove terminal branches that do not taper (tip/origin cross-sectional area ratio > 0.20) or that are at most 50 µm long
+2. **Self-loop removal**: Remove self-loops shorter than 40 µm
+3. **Spur removal**: Repeatedly remove terminal branches shorter than 80 µm
+4. **Small-component removal**: Remove connected components with a total length below 20 µm
+5. **Merge degree-2 nodes**: Join the two edges of every degree-2 node into one continuous edge (run even without pruning)
+6. **Border trimming**: Remove every edge with a point closer than 100 µm (XY) or 2 µm (Z) to the volume border, then remove the isolated nodes
+
+Steps 1 to 4 run only when `do_prune_graph=True` (the default). Every threshold is given in µm and converted to voxels with `voxel_size_um`; at the default 2 µm, the length thresholds of steps 1 to 4 correspond to 25, 20, 40 and 10 voxels, respectively, and the border margins of step 6 to 50 voxels in XY and 1 voxel in Z.
+
+**How the tip/origin area ratio works:** Thinning behaves well on tubular segments, but thick, blob-like regions produce many spurious terminal branches. For each terminal branch, `prune_graph` resamples the cross-sectional area profile along the branch to 100 points and takes the thinner half as the tip side. The ratio between the mean area over the 20% of the branch nearest the tip and the area at the origin end measures the taper: a genuine sprout narrows toward its tip (small ratio), whereas a false branch inside a blob remains as thick at its tip as at its origin. The procedure is repeated until no terminal branch is removed.
+
+| Parameter of `construct_vessel_network` | Default | Step or effect |
+|------------------------------------------|---------|----------------|
+| `tip_area_ratio_cutoff` | 0.20 | 1 |
+| `prune_length_cutoff_um` | 50 µm | 1 |
+| `min_loop_um` | 40 µm | 2 |
+| `min_spur_um` | 80 µm | 3 |
+| `min_component_um` | 20 µm | 4 |
+| `vicinity_xy_um` | 100 µm | 6 |
+| `vicinity_z_um` | 2 µm | 6 |
+| `keep_rings` | `False` | Keep closed rings without a node (sknw `ring=True`) |
+| `keep_isolated` | `False` | Keep degree-0 nodes, the only skeleton of compact, near-spherical objects |
+
+The individual steps can also be called directly, with thresholds in voxels:
 
 ```python
-from vascumap.pipeline.skeletonization import prune_graph, finalize_graph
+from vascumap.pipeline.skeletonization import prune_graph, collect_border_vicinity_edges
 
-pruned = prune_graph(graph, area_3d, edt_cutoff=0.25, length_cutoff=25)
-final = finalize_graph(pruned, binary_edt)
+# 2 µm voxels: 25 voxels = 50 µm, 50 voxels = 100 µm
+pruned = prune_graph(graph, area_3d, tip_area_ratio_cutoff=0.20, length_cutoff=25)
+trimmed = collect_border_vicinity_edges(pruned, binary_mask.shape, vicinity_z=1, vicinity_xy=50)
 ```
 
-**Key functions:** [`prune_graph`](#prune_graph), [`finalize_graph`](#finalize_graph), [`collect_border_vicinity_edges`](#collect_border_vicinity_edges)
+In practice, [`construct_vessel_network`](#construct_vessel_network) runs the whole sequence, from hole filling to border trimming:
+
+```python
+import pandas as pd
+from vascumap.pipeline.graph_main import construct_vessel_network
+
+global_df = pd.DataFrame({'sample': ['sample1']})
+graph, area_image, area_image_exact, filled_mask = construct_vessel_network(
+    binary_mask,
+    global_df,               # receives chip_volume, vessel_volume, vessel_volume_fraction
+    skel_method="thinning",
+    voxel_size_um=2.0,
+)
+```
+
+**Key functions:** [`construct_vessel_network`](#construct_vessel_network), [`prune_graph`](#prune_graph), [`collect_border_vicinity_edges`](#collect_border_vicinity_edges), [`finalize_graph`](#finalize_graph) (contraction method)
 
 ---
 
@@ -1227,41 +1405,58 @@ final = finalize_graph(pruned, binary_edt)
 Compute morphometric features from the graph:
 
 ```python
+import pandas as pd
 from vascumap.pipeline.metrics import (
     compute_cross_sectional_areas,
+    compute_cross_sectional_areas_exact,
     compute_vessel_metrics,
     compute_junction_metrics,
     fractal_dimension_and_lacunarity,
     convex_hull_volume
 )
+from vascumap.pipeline.visualization import graph2image
 
-# Cross-sectional areas at skeleton points
+# Cross-sectional areas at skeleton points (voxel², fast ellipse approximation)
 area_3d = compute_cross_sectional_areas(mask, skeleton, edt)
 
-# Per-vessel metrics
-vessel_df = compute_vessel_metrics(graph, area_3d, pd.DataFrame())
+# Local vessel volume per skeleton voxel (voxel³, nearest-centerline partition on the GPU)
+area_3d_exact = compute_cross_sectional_areas_exact(mask, skeleton, overlap=128)
 
-# Per-junction metrics
-junction_df = compute_junction_metrics(graph, pd.DataFrame(), distance_threshold=250)
+# Per-vessel metrics (µm, µm², µm³)
+vessel_df = compute_vessel_metrics(graph, area_3d, pd.DataFrame(),
+                                   area_image_exact=area_3d_exact, voxel_size_um=2.0)
 
-# Global metrics
-fd, lacunarity = fractal_dimension_and_lacunarity(skeleton > 0)
-explant_vol = convex_hull_volume(mask)
+# Per-junction metrics (distances in µm; neighbors counted within 500 µm)
+junction_df = compute_junction_metrics(graph, pd.DataFrame(),
+                                       distance_threshold=500, voxel_size_um=2.0)
+
+# Global metrics on the final skeleton, rasterized from the graph
+fd, lacunarity = fractal_dimension_and_lacunarity(graph2image(graph, mask.shape) > 0)
+chip_volume_um3 = convex_hull_volume(mask) * 2.0 ** 3
 ```
 
-**Key functions:** [`compute_cross_sectional_areas`](#compute_cross_sectional_areas), [`compute_vessel_metrics`](#compute_vessel_metrics), [`compute_junction_metrics`](#compute_junction_metrics), [`fractal_dimension_and_lacunarity`](#fractal_dimension_and_lacunarity), [`convex_hull_volume`](#convex_hull_volume)
+**Two cross-sectional area estimates:** [`compute_cross_sectional_areas`](#compute_cross_sectional_areas) models each cross-section as an ellipse whose semi-axes are the 3D EDT and the EDT of the Z-maximum projection of the mask. This estimate is fast, but vessels that overlap in the projection are merged, so the area is overestimated in dense regions. [`compute_cross_sectional_areas_exact`](#compute_cross_sectional_areas_exact) avoids the projection: a Euclidean feature transform assigns every foreground voxel, in full 3D, to its nearest skeleton voxel (a Voronoi partition of the vessel around its centerline), so that the number of voxels assigned to a skeleton voxel equals the vessel volume carried by that centerline point. Dividing this local volume by the local centerline step yields the perpendicular cross-sectional area, and summing the local volumes along an edge yields the vessel volume. The partition is computed in chunks on the GPU, with an overlap that must exceed the largest vessel radius; `construct_vessel_network(compute_exact_area=False)` or `--no_exact_area` skips it.
+
+In practice, [`calculate_graph_metrics`](#calculate_graph_metrics) runs these functions on the output of `construct_vessel_network` and adds the global columns listed in [Section 4.1](#41-global-metrics-csv).
+
+**Key functions:** [`calculate_graph_metrics`](#calculate_graph_metrics), [`compute_cross_sectional_areas`](#compute_cross_sectional_areas), [`compute_cross_sectional_areas_exact`](#compute_cross_sectional_areas_exact), [`compute_vessel_metrics`](#compute_vessel_metrics), [`compute_junction_metrics`](#compute_junction_metrics), [`fractal_dimension_and_lacunarity`](#fractal_dimension_and_lacunarity), [`convex_hull_volume`](#convex_hull_volume)
 
 ---
 
 ### 2.3.4 Output Files
 
-Graph analysis produces three output files:
+Graph analysis writes its output files into the mask folder:
 
 | File | Format | Content |
 |------|--------|---------|
 | `global_metrics_{method}.csv` | CSV | One row per sample, aggregate statistics |
-| `{sample}_vessel_metrics_{method}.h5` | HDF5 | One row per vessel segment |
-| `{sample}_junction_metrics_{method}.h5` | HDF5 | One row per node |
+| `{sample}_vessel_metrics_{method}.h5` | HDF5 | One row per vessel segment (with `--save_local_metrics`) |
+| `{sample}_junction_metrics_{method}.h5` | HDF5 | One row per node (with `--save_local_metrics`) |
+| `{sample}_graph_{method}.png` | PNG | Graph drawn over the Z-sum projection of the mask (with `--graph_visualization`) |
+
+`{sample}` is the mask file name without extension (for example `stack1_vessel_mask`), and `{method}` is the skeletonization method. Masks are found with the pattern `*{suffix}.tif`. The global CSV is rewritten after every mask, so that it holds all masks processed so far; a mask without foreground contributes a row with its name only, and a mask that raises an error is reported and skipped.
+
+In the graph figure, each edge is colored by the median equivalent diameter of its cross-sections, d = 2√(A/π), in µm (magma color map, from half the minimum diameter to the 90th percentile), and the nodes are colored by type: sprout tips in lime, other free ends in orange and junctions in white.
 
 #### Reading Output Files
 
@@ -1272,10 +1467,10 @@ import pandas as pd
 global_df = pd.read_csv('global_metrics_thinning.csv')
 
 # Vessel metrics (requires: pip install tables)
-vessel_df = pd.read_hdf('sample_vessel_metrics_thinning.h5', key='df')
+vessel_df = pd.read_hdf('stack1_vessel_mask_vessel_metrics_thinning.h5', key='df')
 
 # Junction metrics
-junction_df = pd.read_hdf('sample_junction_metrics_thinning.h5', key='df')
+junction_df = pd.read_hdf('stack1_vessel_mask_junction_metrics_thinning.h5', key='df')
 ```
 
 #### Full Pipeline Command
@@ -1285,9 +1480,24 @@ python -m vascumap.pipeline.graph_main \
     --masks_dir_path /path/to/masks \
     --file_suffix _vessel_mask \
     --method thinning \
+    --voxel_size_um 2.0 \
     --save_local_metrics \
     --graph_visualization
 ```
+
+**All parameters explained:**
+
+| Parameter | Default | What it Does |
+|-----------|---------|--------------|
+| `--masks_dir_path` | Required | Folder with the mask files; the outputs are written there |
+| `--file_suffix` | `_mask` | Masks are the files matching `*{suffix}.tif` |
+| `--method` | `thinning` | Skeletonization: `thinning` or `contraction` |
+| `--voxel_size_um` | `2.0` | Isotropic voxel size of the masks in µm; converts every threshold and metric to physical units |
+| `--no_exact_area` | off | Skip the nearest-centerline (exact) cross-sectional areas |
+| `--save_local_metrics` | off | Save the per-vessel and per-junction HDF5 tables |
+| `--graph_visualization` | off | Save the graph figure |
+
+Masks written by the inference pipeline are isotropic 2 µm grids, so the default voxel size applies to them; masks on another grid require `--voxel_size_um`, because the pruning thresholds are also defined in µm.
 
 **Key function:** [`process_directory`](#process_directory)
 
@@ -1324,6 +1534,8 @@ dataset = ImageDataset3D(
 
 **Returns:** `tuple(input_tensor, target_tensor)` or `input_tensor`
 
+Without a custom transform, the volumes are converted to float tensors, and training pairs are additionally flipped at random along the TorchIO `LR` and `AP` axes (the same flip for input and target).
+
 ---
 
 ### `Generator`
@@ -1342,6 +1554,7 @@ generator = Generator(
 - Channels: (32, 64, 128, 256, 512)
 - Strides: (1, 2, 2, 2, 1)
 - Residual units: 3 per level
+- Output: one channel, passed through a ReLU
 
 ---
 
@@ -1353,11 +1566,13 @@ generator = Generator(
 
 ```python
 discriminator = Discriminator(
-    dropout_p: float = 0.4    # Dropout probability
+    dropout_p: float = 0.4    # Stored only: the layers contain no dropout
 )
 ```
 
 **Input:** Concatenated input+target (2 channels)
+
+**Architecture:** Five 3D convolutions (kernel 4; 64, 128, 256, 512 and 1 channels), the first four followed by batch normalization and LeakyReLU (0.2) and the last by a sigmoid that yields one real/fake probability per patch.
 
 ---
 
@@ -1382,6 +1597,39 @@ model = Pix2Pix(
 **Loss functions:**
 - Generator: `BCE + λ×L1 + λ×MSE` (λ=100)
 - Discriminator: `BCE`
+
+**Training config:**
+- Optimizers: Adam for each network, with `weight_decay`
+- Schedulers: `CosineAnnealingWarmRestarts` (`T_0`, `T_mult`), stepped after every batch
+- Manual optimization: every training batch is split into chunks of three volumes (`TRAIN_BATCH_SIZE=6`); the first chunk updates the discriminator and the second the generator, so batches must hold 4 to 6 volumes
+- Validation metrics: `val_g_psnr`, `val_g_ssim`, `val_g_accuracy`, `val_d_accuracy`
+
+---
+
+### `train` (image translation)
+
+Train the Pix2Pix model from two folders of paired NIfTI volumes; called by the command line of `train.py`.
+
+**Source:** [`train.py`](vascumap/models/image_translation/train.py)
+
+```python
+train(
+    input_path: str,                 # Folder of input volumes (.nii.gz)
+    target_path: str,                # Folder of target volumes (.nii.gz)
+    model_path: str,                 # Checkpoint and log folder
+    batch_size: int = 4,
+    epochs: int = 200,
+    generator_lr: float = 1e-3,
+    discriminator_lr: float = 1e-5,
+    generator_dropout: float = 0.1,
+    discriminator_dropout: float = 0.25,
+    val_split: float = 0.1,
+    num_workers: int = 0,
+    device: str = 'cuda'             # Used for the architecture summaries
+)
+```
+
+Sets `lr_scheduler_T_0` to two epochs of batches, keeps the five checkpoints with the highest `val_g_ssim` and saves the final weights to `last_epoch_full.pth`.
 
 ---
 
@@ -1410,6 +1658,33 @@ model = SegmentationModule(
 - Loss: Dice + BCE
 - Optimizer: RAdam (weight_decay=1e-4)
 - Scheduler: StepLR (halves at max_epochs/2)
+- Metrics: `BinaryF1Score` (logged as Dice, `train_dice`/`val_dice`) and binary `JaccardIndex` (`train_iou`/`val_iou`)
+
+---
+
+### `train` (segmentation)
+
+Train a segmentation model; called by the command line of `training.py`.
+
+**Source:** [`training.py`](vascumap/models/segmentation/training.py)
+
+```python
+train(
+    images_path: str,
+    masks_path: str,
+    model_path: str,                 # Checkpoint and log folder
+    model_str: str,                  # e.g. 'Unet'
+    encoder_str: str,                # e.g. 'mit_b5'
+    weights: str,                    # e.g. 'imagenet'
+    in_channels: int,
+    batch_size: int,
+    epochs: int,
+    learning_rate: float,
+    fp16: bool                       # precision="16-mixed" if True, else 32
+)
+```
+
+Keeps the three checkpoints with the lowest `val_loss` and logs the learning rate once per epoch.
 
 ---
 
@@ -1431,6 +1706,8 @@ model = build_model(
 **Supported architectures:**
 `Unet`, `Unet++`, `MAnet`, `Linknet`, `FPN`, `PSPNet`, `PAN`, `DeepLabV3`, `DeepLabV3+`
 
+For an MiT encoder with `in_channels=1`, the model is built with three input channels and then passed to [`adapt_input_model`](#adapt_input_model); every model has one output class.
+
 **Returns:** `torch.nn.Module`
 
 ---
@@ -1448,6 +1725,8 @@ model = adapt_input_model(
 ```
 
 **Returns:** `nn.Module` with 1-channel first layer
+
+Only models whose encoder has an MiT patch embedding (`encoder.patch_embed1`) are changed; any other model is returned unchanged. The replacement layer is fixed at 64 output channels, the patch-embedding width of `mit_b1` to `mit_b5`.
 
 ---
 
@@ -1468,7 +1747,23 @@ loaders = load_data(
 )
 ```
 
-**Returns:** `OrderedDict` with 'train' and 'valid' DataLoaders
+**Returns:** `OrderedDict` with 'train' and 'valid' DataLoaders when a mask folder is given, otherwise a single inference DataLoader
+
+Training batches are shuffled and incomplete training batches are dropped; all loaders use `num_workers=0`. The training set receives [`hard_transforms`](#hard_transforms) followed by tensor conversion, and the validation set receives tensor conversion only.
+
+---
+
+### `hard_transforms`
+
+Training augmentations (albumentations ≥ 2.0).
+
+**Source:** [`transforms.py`](vascumap/models/segmentation/transforms.py)
+
+```python
+transforms = hard_transforms()
+```
+
+**Returns:** `list` of `HorizontalFlip(p=0.5)`, `VerticalFlip(p=0.5)` and `Affine(translate_percent=(-0.0625, 0.0625), scale=(0.9, 1.1), rotate=(-45, 45), border_mode=cv2.BORDER_REFLECT_101, p=0.5)`, combined with `post_transforms()` (`ToTensorV2`) by `compose()`
 
 ---
 
@@ -1487,6 +1782,8 @@ dataset = SegmentationDataset(
 ```
 
 **Returns:** `dict` with 'image', 'mask', 'filename'
+
+Each image is clipped to its 0.1st–99.9th percentiles, rescaled to [0, 1], cast to float32 and given a trailing channel axis; each mask is binarized (values > 0 become 1, while 0 and NaN become 0) before the transforms are applied.
 
 ---
 
@@ -1515,6 +1812,31 @@ stack, voxel_size, [nz, ny, nx] = get_stack_from_lif(
 - `voxel_size`: `np.ndarray` [Z, Y, X] original
 - `[nz, ny, nx]`: Original dimensions
 
+Raises a `ValueError` when the stack spans less than 160 µm in Z.
+
+---
+
+#### `get_stack_from_aics`
+
+Extract one channel of an aicsimageio scene as a 3D stack and rescale it; used for fluorescence input in any format aicsimageio can read (e.g. `.nd2`).
+
+**Source:** [`data.py`](vascumap/pipeline/data.py)
+
+```python
+stack, voxel_size, [nz, ny, nx] = get_stack_from_aics(
+    img: AICSImage,                      # Scene already selected with img.set_scene(...)
+    channel_index: int,                  # Channel to extract (e.g. GFP)
+    ref_voxel_size: list = [5, 2, 2]     # Target voxel size [Z, Y, X] µm
+)
+```
+
+**Returns:**
+- `stack`: `np.ndarray` (Z, Y, X, 1), float32 before resampling
+- `voxel_size`: `np.ndarray` [Z, Y, X] original, in µm
+- `[nz, ny, nx]`: Original dimensions
+
+Reads the first time point when the file has a time axis. Raises a `ValueError` when the physical pixel sizes are missing or when the stack spans less than 160 µm in Z.
+
 ---
 
 ### Preprocessing
@@ -1531,13 +1853,16 @@ focus, grid = auto_focus(
     crop_window: int = 50,       # Border margin
     n_sampling: int = 20,        # Grid density
     window_size: int = 50,       # Focus patch size
-    viz: bool = False            # Show visualization
+    viz: bool = False,           # Show visualization
+    stack_chan: np.ndarray = None  # Optional extra stack(s) sampled on the same surface
 )
 ```
 
 **Returns:**
 - `focus`: 2D focused image (Y, X)
 - `grid`: Height map of Z-indices (Y, X)
+
+When `stack_chan` is given, the function returns `(focus, focused_channels, grid)` instead.
 
 ---
 
@@ -1556,11 +1881,14 @@ cropped = crop_stack(
     z_range: float = 200,        # Z-thickness in µm
     ref_voxel_size: list = [5, 2, 2],
     lif_path_root: str = None,   # Save debug images here
-    filename: str = None
+    filename: str = None,
+    profile_dir: str = 'crop_profiles'  # Folder holding the profile files
 )
 ```
 
 **Returns:** `np.ndarray` cropped stack
+
+Loads `<crop_profile>_rect.npy` and `<crop_profile>_fiducials.npy` from `profile_dir` and raises a `FileNotFoundError` when either is missing. The debug figure `<filename>_crop_overview.png` is written to `lif_path_root` only when both arguments are given.
 
 ---
 
@@ -1614,7 +1942,7 @@ transformed = transform_coords(
 )
 ```
 
-**Returns:** `np.ndarray` transformed coordinates
+**Returns:** `np.ndarray` transformed coordinates, `scale × (coords @ R(theta)) + [tx, ty]`
 
 ---
 
@@ -1633,6 +1961,47 @@ registered_coords, optimal_params, best_score = register_high_level(
 
 **Returns:** `tuple` (transformed_coords, params, score)
 
+Initializes the parameters with scale 1, no rotation and a translation that centers the template on the edge map, then calls [`register_neck_coords_advanced`](#register_neck_coords_advanced) with the Powell method.
+
+---
+
+#### `register_neck_coords_advanced`
+
+Global and local optimization of the template transformation.
+
+**Source:** [`preprocessing.py`](vascumap/pipeline/preprocessing.py)
+
+```python
+transformed_coords, optimal_params, best_score = register_neck_coords_advanced(
+    neck_coords: np.ndarray,     # Template fiducials (N, 2), (y, x)
+    canny_image: np.ndarray,     # Edge map
+    initial_params: list,        # [scale, theta, tx, ty]
+    method: str = 'Powell'       # Local minimizer
+)
+```
+
+**Returns:** `tuple` (transformed_coords, params, score), or `(None, None, None)` if every optimization fails
+
+Runs basin-hopping (50 hops) from three starting points, refines each result with the local minimizer and keeps the lowest score. Bounds: scale 0.999–1.001, rotation ±1.5 rad, translations ±500 pixels.
+
+---
+
+#### `objective_function`
+
+Registration cost of a set of transformation parameters.
+
+**Source:** [`preprocessing.py`](vascumap/pipeline/preprocessing.py)
+
+```python
+score = objective_function(
+    params: list,                # [scale, theta, tx, ty]
+    coords: np.ndarray,          # Template fiducials (N, 2)
+    canny_image: np.ndarray      # Edge map
+)
+```
+
+**Returns:** `float`, the negative weighted mean edge response at the transformed fiducials (lower is better), or a penalty of `1e6 × (0.9 − valid_ratio)` when fewer than 90% of the fiducials fall inside the image
+
 ---
 
 ### Prediction
@@ -1645,12 +2014,14 @@ Load trained Pix2Pix model.
 
 ```python
 model = load_pix2pix(
-    model_path: str,             # Checkpoint path
-    device: str = 'cuda'
+    model_path: str,             # Lightning checkpoint (.ckpt)
+    device: str = 'cuda'         # Accepted but unused: the model is loaded on the CPU
 )
 ```
 
 **Returns:** `Pix2Pix` in eval mode
+
+Loads the `state_dict` entry of the checkpoint strictly, so a bare state dictionary such as `last_epoch_full.pth` is not accepted.
 
 ---
 
@@ -1663,11 +2034,13 @@ Load trained segmentation model.
 ```python
 model = load_segmentation_model(
     model_path: str,             # Checkpoint path (.pth or .ckpt)
-    device: str = 'cuda'
+    device: str = 'cuda'         # Accepted but unused: the model is loaded on the CPU
 )
 ```
 
 **Returns:** `nn.Module` in eval mode
+
+Builds a `Unet` with an `mit_b5` encoder adapted to one input channel, then loads, non-strictly, the weights of a Lightning `.ckpt` (keys under the `model.` prefix), of a `.pth` with a `model_state_dict` entry or of a bare state dictionary. Missing or unexpected keys are printed instead of raising an error.
 
 ---
 
@@ -1682,11 +2055,13 @@ prediction = predict_pix2pix(
     model_p2p: nn.Module,
     stack_bf: np.ndarray,        # (Z, Y, X) brightfield
     device: str,
-    n_iter: int = 1              # Monte Carlo averaging
+    n_iter: int = 1              # Number of passes averaged
 )
 ```
 
-**Returns:** `np.ndarray` pseudo-fluorescence (Z, Y, X)
+**Returns:** `np.ndarray` pseudo-fluorescence (Z, Y, X), clipped to [0, 1]
+
+Sliding-window inference with ROI 32 × 512 × 512, overlap 0.75/0.25/0.25 and one window per batch, under automatic mixed precision. In eval mode, the `n_iter` passes are identical.
 
 ---
 
@@ -1706,6 +2081,8 @@ proba = predict_mask(
 
 **Returns:** `np.ndarray` probability map (Z, Y, X)
 
+Axial `SliceInferer` with 256 × 256 tiles, 50% overlap, Gaussian blending and `sw_batch_size=16`.
+
 ---
 
 #### `predict_mask_ortho`
@@ -1724,6 +2101,8 @@ proba = predict_mask_ortho(
 
 **Returns:** `np.ndarray` averaged probability map
 
+Axial, coronal and sagittal `SliceInferer` passes with 256 × 256 tiles, 50% overlap, Gaussian blending and `sw_batch_size=32`. For the coronal and sagittal passes, volumes with fewer than 256 Z-planes are padded with -1 to 256 planes, and the padding is cropped from the predictions.
+
 ---
 
 ### Main Pipeline
@@ -1736,18 +2115,23 @@ Run full inference pipeline.
 
 ```python
 run(
-    lif_dir_path: str,           # Directory with .lif files
-    ortho: bool = True,          # Use 2.5D inference
-    bf_index: int = None,        # Brightfield channel (auto-detect if None)
-    fluo_index: int = None,      # Fluorescence channel (skip translation if set)
-    crop_profile: str = 'dorota',
-    z_range: int = 200,
+    input_dir: str,                       # Directory with the microscopy files
+    pattern: str = '*.lif',               # Glob pattern of the files to process
+    ortho: bool = True,                   # Use 2.5D inference
+    bf_index: int = None,                 # Brightfield channel (found by name if None)
+    fluo_channel: str = None,             # Fluorescence channel name, e.g. 'GFP' (skips translation)
+    fluo_index: int = None,               # Fluorescence channel index (skips translation)
+    crop_profile: str = None,
+    crop_profile_dir: str = 'crop_profiles',
+    z_range: int = 200,                   # µm kept around the focal surface
     save_all_stacks: bool = False,
     crop: bool = True,
-    model_p2p_path: str = None,
-    model_smp_path: str = None
+    model_p2p_path: str = None,           # Required for brightfield input
+    model_smp_path: str = None            # Required
 )
 ```
+
+Raises a `ValueError` when `model_smp_path` is missing, or when `model_p2p_path` is missing for brightfield input. Each stack is loaded, optionally cropped, translated (brightfield input only), segmented and saved as described in [Full Pipeline Command](#full-pipeline-command); an error in one stack is printed and the next stack is processed.
 
 ---
 
@@ -1764,12 +2148,15 @@ Parallel thinning using Dask.
 ```python
 skeleton = skeletonize_3d_parallel(
     binary_volume: np.ndarray,
-    chunk_size: tuple = (128, 128, 128),
+    chunk_size: tuple = (512, 512, 512),
+    overlap: int | tuple = 128,  # Halo in voxels; scalar or per-axis (z, y, x)
     iter: int = 1
 )
 ```
 
 **Returns:** `np.ndarray` skeleton image
+
+The overlap is clamped per axis so that it never exceeds the volume or the chunk size, which keeps the XY overlap at 128 voxels for thin-Z volumes.
 
 ---
 
@@ -1782,19 +2169,21 @@ Remove spurious branches.
 ```python
 pruned = prune_graph(
     graph: nx.Graph,
-    area_3d: np.ndarray,         # Cross-sectional areas
-    edt_cutoff: float = 0.25,    # EDT ratio threshold
-    length_cutoff: int = 25      # Minimum branch length
+    area_3d: np.ndarray,                 # Cross-sectional areas (voxel²) at skeleton voxels
+    tip_area_ratio_cutoff: float = 0.25, # Maximum tip/origin area ratio of a kept sprout
+    length_cutoff: int = 25              # Terminal branches up to this length (voxels) are removed
 )
 ```
 
 **Returns:** `nx.Graph` pruned
 
+A terminal branch is removed when its tip/origin cross-sectional area ratio exceeds `tip_area_ratio_cutoff` (it does not taper) or when its length is at most `length_cutoff`; tapering sprouts of sufficient length are kept. The pass is repeated until no terminal branch is removed. [`construct_vessel_network`](#construct_vessel_network) calls it with a cutoff of 0.20 and a length of 50 µm.
+
 ---
 
 #### `finalize_graph`
 
-Clean graph: merge degree-2 nodes, clip coordinates.
+Clean graph: merge degree-2 nodes, clip coordinates. Used by the mesh contraction method; it also flags degree-1 nodes as sprout tips, removes edges whose two nodes both have degree 1 and rasterizes every edge into a continuous voxel path.
 
 **Source:** [`skeletonization.py`](vascumap/pipeline/skeletonization.py)
 
@@ -1819,12 +2208,15 @@ Remove edges near image borders.
 trimmed = collect_border_vicinity_edges(
     graph: nx.Graph,
     image_shape: tuple,
-    vicinity_z: int = 1,
-    vicinity_xy: int = 50
+    vicinity_z: int = 1,         # Z-margin in voxels
+    vicinity_xy: int = 50,       # XY-margin in voxels
+    keep_isolated: bool = False  # Keep degree-0 nodes
 )
 ```
 
-**Returns:** `nx.Graph` with border edges removed
+**Returns:** `nx.Graph` (a copy) with border edges removed
+
+An edge is removed when any of its points lies within the margins. The nodes left with degree 0 are then removed, unless `keep_isolated=True`, in which case they are kept as the only skeleton of compact, near-spherical objects.
 
 ---
 
@@ -1861,6 +2253,8 @@ graph, mesh, simple_mesh, contracted = create_graph_contraction(
 
 **Returns:** `tuple` (graph, original_mesh, simplified_mesh, contracted_mesh)
 
+Calls [`contract_gpu`](#contract_gpu) with `precision=1e-9`, `SL=4` and `WH0=2`.
+
 ---
 
 #### `contract_gpu`
@@ -1875,9 +2269,13 @@ contracted = contract_gpu(
     epsilon: float = 1e-6,       # Convergence threshold
     iter_lim: int = 100,
     time_lim: int = None,        # Seconds
+    precision: float = 1e-7,     # Solver tolerance (LSMR)
     SL: float = 2,               # Contraction weight multiplier
     WH0: float = 1,              # Initial attraction weight
-    operator: str = 'cotangent' # 'cotangent' or 'umbrella'
+    WL0: str | float = 'auto',   # Initial contraction weight ('auto' from mesh statistics)
+    operator: str = 'cotangent', # 'cotangent' or 'umbrella'
+    progress: bool = True,
+    validate: bool = True
 )
 ```
 
@@ -1898,11 +2296,14 @@ repositioned = reposition_graph_edges(
     min_segment_length: float = 5.0,
     max_disp: float = 12.5,
     step_size: float = 1.0,
-    num_iterations: int = 1000
+    num_iterations: int = 1000,
+    tol: float = 1e-3            # Gradient norm at which a node stops
 )
 ```
 
 **Returns:** `nx.Graph` repositioned
+
+[`construct_vessel_network`](#construct_vessel_network) calls it with `min_segment_length=10`, `max_disp=10`, `step_size=1`, `num_iterations=1000` and `tol=1e-20`.
 
 ---
 
@@ -1924,7 +2325,30 @@ area_3d = compute_cross_sectional_areas(
 
 **Formula:** `Area = π × EDT_2D(y,x) × EDT_3D(z,y,x)`
 
-**Returns:** `np.ndarray` with areas at skeleton points
+**Returns:** `np.ndarray` with areas (voxel²) at skeleton points
+
+Fast approximation: the 2D EDT is computed on the Z-maximum projection of the mask, so vessels that overlap in projection are merged and the area is overestimated in dense regions.
+
+---
+
+#### `compute_cross_sectional_areas_exact`
+
+Compute the local vessel volume carried by each skeleton voxel (nearest-centerline partition).
+
+**Source:** [`metrics.py`](vascumap/pipeline/metrics.py)
+
+```python
+local_volume = compute_cross_sectional_areas_exact(
+    mask: np.ndarray,            # Binary mask (foreground > 0)
+    skeleton_image: np.ndarray,  # Skeleton
+    chunk_size: tuple = None,    # Defaults to (Z, 512, 512)
+    overlap: int | tuple = 128   # Halo in voxels; scalar or per-axis (z, y, x)
+)
+```
+
+**Returns:** `np.ndarray` volume (voxel³) carried by each skeleton voxel, zero elsewhere
+
+Every foreground voxel is assigned in 3D to its nearest skeleton voxel with a Euclidean feature transform computed in chunks on the GPU (CuPy). The overlap must exceed the largest vessel radius, so that the nearest centerline of a foreground voxel is never in an unseen neighboring chunk; it is clamped per axis to the volume and chunk size. [`compute_vessel_metrics`](#compute_vessel_metrics) converts the local volumes into areas by dividing them by the local centerline step.
 
 ---
 
@@ -1937,12 +2361,14 @@ Compute per-edge metrics.
 ```python
 vessel_df = compute_vessel_metrics(
     graph: nx.Graph,
-    area_image: np.ndarray,
-    vessel_metrics_df: pd.DataFrame
+    area_image: np.ndarray,              # Cross-sectional areas (voxel²)
+    vessel_metrics_df: pd.DataFrame,     # Unused; a new DataFrame is returned
+    area_image_exact: np.ndarray = None, # Local volumes from compute_cross_sectional_areas_exact
+    voxel_size_um: float = 2.0           # Isotropic voxel size for unit conversion
 )
 ```
 
-**Returns:** `pd.DataFrame` with columns: `z, y, x, volume, length, shortest_path, tortuosity, is_sprout, mean_cs_area, median_cs_area, std_cs_area, node1_degree, node2_degree, orientation_z, orientation_y, orientation_x`
+**Returns:** `pd.DataFrame` indexed by the edge end nodes (`node1`, `node2`), with columns: `z, y, x, vessel_volume, vessel_length, end_to_end_distance, tortuosity, is_sprout, mean_cross_sectional_area, median_cross_sectional_area, std_cross_sectional_area, node1_degree, node2_degree, orientation_z, orientation_y, orientation_x`, plus `mean_cross_sectional_area_exact, median_cross_sectional_area_exact, std_cross_sectional_area_exact, vessel_volume_exact` when `area_image_exact` is given. Lengths are in µm, areas in µm² and volumes in µm³ (see [Section 4.2](#42-vessel-metrics-hdf5)).
 
 ---
 
@@ -1955,12 +2381,15 @@ Compute per-node metrics.
 ```python
 junction_df = compute_junction_metrics(
     graph: nx.Graph,
-    junction_metrics_df: pd.DataFrame,
-    distance_threshold: int = 50
+    junction_metrics_df: pd.DataFrame,  # Unused; a new DataFrame is returned
+    distance_threshold: float = 50,     # Neighbor-counting radius in µm
+    voxel_size_um: float = 2.0          # Distances are reported in µm
 )
 ```
 
-**Returns:** `pd.DataFrame` with columns: `z, y, x, number_of_vessel_per_node, is_sprout_tip, is_junction, dist_nearest_junction, dist_nearest_endpoint, num_junction_neighbors, num_endpoint_neighbors`
+**Returns:** `pd.DataFrame` indexed by node, with columns: `z, y, x, node_degree, is_sprout_tip, is_junction, nearest_junction_distance, nearest_sprout_tip_distance, junction_neighbor_count, sprout_tip_neighbor_count` (see [Section 4.3](#43-junction-metrics-hdf5))
+
+[`calculate_graph_metrics`](#calculate_graph_metrics) calls it with `distance_threshold=500` (µm).
 
 ---
 
@@ -1973,9 +2402,11 @@ Box-counting fractal analysis.
 ```python
 fd, lacunarity = fractal_dimension_and_lacunarity(
     array: np.ndarray,           # Binary
-    max_box_size: int = None,    # Auto from image
-    min_box_size: int = 1,
-    n_samples: int = 20
+    max_box_size: int = None,    # log2 of the largest box; default floor(log2(min(array.shape)))
+    min_box_size: int = 1,       # log2 of the smallest box (2 voxels)
+    n_samples: int = 20,         # Number of box sizes
+    n_offsets: int = 0,          # Grid offsets per box size (0 = a single, unshifted grid)
+    plot: bool = False           # Accepted; no plot is drawn
 )
 ```
 
@@ -1995,7 +2426,7 @@ volume = convex_hull_volume(
 )
 ```
 
-**Returns:** `float` hull volume in voxels³
+**Returns:** `float` hull volume in voxels³ (0 for fewer than four foreground voxels)
 
 ---
 
@@ -2010,13 +2441,17 @@ Process all masks in a directory.
 ```python
 process_directory(
     masks_dir_path: str,
-    suffix: str,                 # e.g., '_vessel_mask'
+    suffix: str,                     # e.g., '_vessel_mask'
     save_local_metrics: bool,
     visualization: bool = True,
-    skel_method: str = "thinning",
-    contraction_timelim: int = 300
+    skel_method: str = "thinning",   # 'thinning', 'contraction' or 'auto'
+    contraction_timelim: int = 300,  # Seconds
+    voxel_size_um: float = 2.0,      # Isotropic voxel size of the masks in µm
+    compute_exact_area: bool = True  # Also compute the nearest-centerline areas
 )
 ```
+
+Writes the files listed in [Section 2.3.4](#234-output-files) into `masks_dir_path`.
 
 ---
 
@@ -2027,15 +2462,35 @@ Build graph from binary mask.
 **Source:** [`graph_main.py`](vascumap/pipeline/graph_main.py)
 
 ```python
-graph, area_image = construct_vessel_network(
-    binary_image: np.ndarray,
-    global_metrics_df: pd.DataFrame,
-    skel_method: str = "auto",
-    contraction_timelim: int = 300
+graph, area_image, area_image_exact, binary_filled_holes = construct_vessel_network(
+    binary_image: np.ndarray,              # Binary vessel mask on an isotropic grid
+    global_metrics_df: pd.DataFrame,       # Receives the global volume columns
+    skel_method: str = "thinning",         # 'thinning', 'contraction' or 'auto'
+    contraction_timelim: int = 300,        # Seconds
+    do_prune_graph: bool = True,           # Tip/origin, spur, loop and component pruning
+    voxel_size_um: float = 2.0,            # Isotropic voxel size in µm
+    compute_exact_area: bool = True,       # Also compute the nearest-centerline areas
+    min_spur_um: float = 80.0,             # Terminal branches shorter than this are removed
+    min_loop_um: float = 40.0,             # Self-loops shorter than this are removed
+    min_component_um: float = 20.0,        # Components shorter in total are removed
+    prune_length_cutoff_um: float = 50.0,  # prune_graph length cutoff
+    vicinity_xy_um: float = 100.0,         # XY border margin
+    vicinity_z_um: float = 2.0,            # Z border margin
+    keep_rings: bool = False,              # Keep closed rings without a node
+    tip_area_ratio_cutoff: float = 0.20,   # prune_graph tip/origin area ratio
+    keep_isolated: bool = False,           # Keep degree-0 nodes (compact objects)
+    chunk_size: tuple = None,              # GPU chunk size; default (Z, 512, 512)
+    overlap: tuple = None                  # Chunk overlap; default (128, 128, 128)
 )
 ```
 
-**Returns:** `tuple` (NetworkX graph, area volume)
+**Returns:** `tuple`
+- `graph`: NetworkX graph, pruned and border-trimmed
+- `area_image`: Cross-sectional areas (voxel²) at skeleton voxels
+- `area_image_exact`: Local vessel volume (voxel³) per skeleton voxel, or `None` if `compute_exact_area=False`
+- `binary_filled_holes`: The hole-filled binary mask (float32)
+
+Every threshold is given in µm and converted to voxels with `voxel_size_um` (Section 2.3.2). The overlap, clamped per axis to the volume size, must exceed the largest vessel radius, because hole filling, the EDT and skeletonization are not local operations; a single chunk covering the whole volume removes the seams altogether when it fits in GPU memory. The function writes `chip_volume`, `vessel_volume` and `vessel_volume_fraction` into `global_metrics_df`. With `skel_method="auto"`, thinning is used when the vessel volume fraction exceeds 0.3, and mesh contraction otherwise.
 
 ---
 
@@ -2049,12 +2504,54 @@ Compute all metrics from graph.
 global_df, junction_df, vessel_df = calculate_graph_metrics(
     graph: nx.Graph,
     sample_name: str,
-    area_image: np.ndarray,
-    global_metrics_df: pd.DataFrame
+    area_image: np.ndarray,               # Cross-sectional areas (voxel²)
+    global_metrics_df: pd.DataFrame,      # Must already hold chip_volume
+    area_image_exact: np.ndarray = None,  # Local volumes (voxel³)
+    voxel_size_um: float = 2.0
 )
 ```
 
-**Returns:** `tuple` of DataFrames
+**Returns:** `tuple` of DataFrames (global, junction, vessel); the global columns are listed in [Section 4.1](#41-global-metrics-csv)
+
+---
+
+### Visualization
+
+#### `visualize_vessel_network`
+
+Draw the vessel graph over a Z-sum projection of the mask.
+
+**Source:** [`visualization.py`](vascumap/pipeline/visualization.py)
+
+```python
+visualize_vessel_network(
+    binary_image: np.ndarray,          # Binary mask (background projection)
+    graph: nx.Graph,
+    area_image: np.ndarray = None,     # Cross-sectional areas (voxel²) at skeleton voxels
+    sample_name: str = "Vessel Network",  # Plot title
+    voxel_size_um: float = 2.0
+)
+```
+
+Edges are colored by the median equivalent diameter of their cross-sections, d = 2√(A/π), in µm, with a horizontal color bar below the panel; without `area_image`, every edge is drawn in one color. Nodes are colored by type: sprout tips in lime, other free ends in orange and junctions in white. The figure is left open for the caller to save.
+
+---
+
+#### `graph2image`
+
+Rasterize a graph back into a binary skeleton image.
+
+**Source:** [`visualization.py`](vascumap/pipeline/visualization.py)
+
+```python
+skeleton = graph2image(
+    graph: nx.Graph,
+    shape: tuple,                # Output shape (Z, Y, X)
+    include_nodes: bool = False  # Also draw node voxels ('pts_all' when kept)
+)
+```
+
+**Returns:** `np.ndarray` binary skeleton image
 
 ---
 
@@ -2088,7 +2585,7 @@ scaled = scale(
 )
 ```
 
-**Returns:** `np.ndarray` in [0, 1]
+**Returns:** `np.ndarray` (float32) in [0, 1]
 
 ---
 
@@ -2098,12 +2595,12 @@ Dask-based 3D rescaling.
 
 ```python
 resized = resize_dask(
-    stack: np.ndarray,
+    stack: np.ndarray,           # (Z, Y, X) or (Z, Y, X, C)
     rescale_factor: list         # [z, y, x] factors
 )
 ```
 
-**Returns:** `np.ndarray` resized
+**Returns:** `np.ndarray` resized with cubic interpolation (`order=3`); a trailing channel axis is kept
 
 ---
 
@@ -2114,10 +2611,10 @@ Apply GPU function to volume in chunks.
 ```python
 result = cupy_chunk_processing(
     volume: np.ndarray,
-    processing_func: callable,
+    processing_func: callable,   # Takes a CuPy array as first argument
     chunk_size: tuple = (64, 512, 512),
     overlap: tuple = (15, 15, 15),
-    **kwargs                     # Passed to processing_func
+    *args, **kwargs              # Passed to processing_func (NumPy arrays moved to the GPU)
 )
 ```
 
@@ -2153,8 +2650,8 @@ mask = process_vessel_mask(
 ```
 
 **Processing:**
-- If `ortho=True`: median filter (size=7) + threshold (0.2, 0.5)
-- If `ortho=False`: threshold (0.1, 0.5)
+- If `ortho=True`: median filter (size=7, GPU chunks of 32 × 1024 × 1024) + hysteresis threshold (0.2, 0.5)
+- If `ortho=False`: hysteresis threshold (0.1, 0.5)
 
 **Returns:** `np.ndarray` binary mask
 
@@ -2170,7 +2667,7 @@ remove_false_positives(
 )
 ```
 
-Modifies file in-place, saves backup as `*_backup.tif`.
+Fits a Gaussian to the vessel area per Z-plane and, when an excess of detections is found below the fitted peak, sets the planes below the cutoff to zero. In that case, the original file is renamed with every occurrence of `mask` in its path replaced by `mask_backup` (for example `sample_vessel_mask_backup.tif`), and the corrected mask is written in its place. A diagnostic figure, `*mask_correction.png`, is saved whenever the fit succeeds. This function is not called by the pipeline.
 
 ---
 
@@ -2178,74 +2675,93 @@ Modifies file in-place, saves backup as `*_backup.tif`.
 
 ## 4.1 Global Metrics (CSV)
 
-Stored in `global_metrics_{method}.csv`, one row per sample.
+Stored in `global_metrics_{method}.csv`, one row per sample. Lengths are in µm, areas in µm² and volumes in µm³, converted with `voxel_size_um` (`v` below); "heterogeneity" denotes a standard deviation across vessels or nodes.
 
-### Volume & Coverage
+### Volume
 
 | Column | Unit | Description | Formula |
 |--------|------|-------------|---------|
-| `sample` | - | Sample identifier | - |
-| `explant_volume` | voxels³ | Convex hull volume | `ConvexHull(foreground).volume` |
-| `image_volume` | voxels³ | Total image volume | `Z × Y × X` |
-| `total_vessel_volume` | voxels³ | Foreground voxels | `sum(mask)` |
-| `vessel_coverage_explant` | ratio | Vessel/explant | `vessel_volume / explant_volume` |
-| `vessel_coverage_image` | ratio | Vessel/image | `vessel_volume / image_volume` |
-| `skeletonization_method` | - | 'thinning' or 'contraction' | - |
+| `sample` | - | Sample identifier (mask file name without extension) | - |
+| `chip_volume` | µm³ | Convex-hull volume of the hole-filled mask inside the border margins (100 µm in XY, 2 µm in Z by default) | `ConvexHull(interior foreground).volume × v³` |
+| `vessel_volume` | µm³ | Foreground volume of the hole-filled mask (whole volume) | `sum(filled mask) × v³` |
+| `vessel_volume_fraction` | ratio | Vessel volume relative to chip volume | `vessel_volume / chip_volume` |
 
 ### Network Topology
 
+All counts and lengths refer to the final graph, after pruning and border trimming.
+
 | Column | Unit | Description | Formula |
 |--------|------|-------------|---------|
-| `total_vessel_length` | voxels | Sum of edge lengths | `Σ length(edge)` |
-| `total_number_of_sprouts` | count | Edges with degree-1 endpoint | Vessels connected to tips |
-| `total_number_of_branches` | count | Edges between junctions | Both endpoints degree ≥ 2 |
-| `total_number_of_junctions` | count | Nodes with degree ≥ 2 | Branch points |
+| `total_vessel_length` | µm | Sum of edge lengths | `Σ length(edge) × v` |
+| `total_sprout_count` | count | Edges with at least one sprout-tip end | Vessels connected to tips |
+| `total_branch_count` | count | Edges with no sprout-tip end | Edges between junctions |
+| `total_junction_count` | count | Nodes with degree ≥ 3 | Branch points |
+| `vessel_length_density` | µm⁻² | Vessel length per chip volume | `total_vessel_length / chip_volume` |
+| `sprout_density_per_vessel_length` | µm⁻¹ | Sprouts per vessel length | `total_sprout_count / total_vessel_length` |
+| `junction_density_per_vessel_length` | µm⁻¹ | Junctions per vessel length | `total_junction_count / total_vessel_length` |
+| `sprout_density_per_chip_volume` | µm⁻³ | Sprouts per chip volume | `total_sprout_count / chip_volume` |
+| `junction_density_per_chip_volume` | µm⁻³ | Junctions per chip volume | `total_junction_count / chip_volume` |
+
+A sprout tip is a node flagged when the skeleton graph is built (degree 1 before pruning), so an edge cut by border trimming does not turn its remaining end into a sprout tip.
 
 ### Fractal Analysis
 
+Computed on the final, pruned and border-trimmed skeleton, rasterized from the graph edges, so that it describes the same structure as the length and count metrics.
+
 | Column | Unit | Description | Formula |
 |--------|------|-------------|---------|
-| `fractal_dimension` | - | Box-counting dimension | `slope(log(N) vs log(1/ε))` |
-| `lacunarity` | - | Heterogeneity measure | `mean(Var(H)/Mean(H)²)` |
+| `skeleton_fractal_dimension` | - | Box-counting dimension | `slope(log(N) vs log(1/ε))` |
+| `skeleton_lacunarity` | - | Heterogeneity measure | `mean(Var(H)/Mean(H)²)` |
 
 **Interpretation:**
 - Fractal dimension ≈ 1: Linear structure
 - Fractal dimension ≈ 2: Area-filling
 - Fractal dimension ≈ 3: Volume-filling
-- Typical vessels: 1.3 - 2.5
 
-### Aggregated Statistics
+### Morphology and Spacing
 
-Pattern: `{statistic}_{type}_{metric}`
+| Column | Unit | Description | Formula |
+|--------|------|-------------|---------|
+| `median_vessel_tortuosity` | ratio | Median tortuosity of the edges | `median(tortuosity)` |
+| `vessel_tortuosity_heterogeneity` | ratio | Spread of edge tortuosity | `std(tortuosity)` |
+| `median_vessel_cross_sectional_area` | µm² | Median over edges of the per-edge median area | `median(median_cross_sectional_area)` |
+| `vessel_cross_sectional_area_heterogeneity` | µm² | Spread of the per-edge median area | `std(median_cross_sectional_area)` |
+| `median_vessel_cross_sectional_area_exact` | µm² | As above, from the nearest-centerline areas | `median(median_cross_sectional_area_exact)` |
+| `vessel_cross_sectional_area_heterogeneity_exact` | µm² | As above, from the nearest-centerline areas | `std(median_cross_sectional_area_exact)` |
+| `median_junction_nearest_neighbor_distance` | µm | Median distance from a junction to the nearest other junction | `median(nearest_junction_distance)` over `is_junction` nodes |
+| `junction_spacing_heterogeneity` | µm | Spread of that distance | `std(nearest_junction_distance)` over `is_junction` nodes |
+| `median_sprout_tip_nearest_neighbor_distance` | µm | Median distance from a sprout tip to the nearest other sprout tip | `median(nearest_sprout_tip_distance)` over `is_sprout_tip` nodes |
+| `sprout_tip_spacing_heterogeneity` | µm | Spread of that distance | `std(nearest_sprout_tip_distance)` over `is_sprout_tip` nodes |
 
-**Statistics:** `mean`, `std`, `median`  
-**Types:** `branch` (both ends junction), `sprout` (one end tip), `sprout_and_branch` (all)  
-**Vessel metrics:** `volume`, `length`, `shortest_path`, `tortuosity`
-
-**Junction types:** `junction` (degree ≥ 2), `sprout_tip` (degree = 1), `junction_and_sprout_tip` (all)  
-**Junction metrics:** `number_of_vessel_per_node`, `dist_nearest_junction`, `dist_nearest_endpoint`, `num_junction_neighbors`, `num_endpoint_neighbors`
+The two `_exact` columns are present only when the nearest-centerline areas were computed (the default; omitted with `--no_exact_area`). Medians and standard deviations ignore NaN values. The spacing metrics use the `is_junction` flag of the junction table (every node that is not a sprout tip), which can include nodes of degree below 3 that were junctions before pruning or border trimming, whereas `total_junction_count` counts nodes of degree ≥ 3 only.
 
 ---
 
 ## 4.2 Vessel Metrics (HDF5)
 
-Stored in `{sample}_vessel_metrics_{method}.h5`, one row per edge.
+Stored in `{sample}_vessel_metrics_{method}.h5`, one row per edge, indexed by the end nodes of the edge (`node1`, `node2`). `pᵢ` are the centerline voxels of the edge and `v` the voxel size in µm.
 
 | Column | Type | Unit | Description | Formula |
 |--------|------|------|-------------|---------|
 | `z`, `y`, `x` | array | voxels | Coordinates along vessel | Path points |
-| `length` | float | voxels | Path length | `Σ ‖pᵢ₊₁ - pᵢ‖` |
-| `shortest_path` | float | voxels | Endpoint distance | `‖p_last - p_first‖` |
-| `tortuosity` | float | ratio | Curvature measure | `length / shortest_path` (clipped [0,5]) |
-| `volume` | float | voxels³ | Segment volume | `Σ area(pᵢ)` |
-| `mean_cs_area` | float | voxels² | Mean cross-section | `mean(π × r_3D × r_2D)` |
-| `median_cs_area` | float | voxels² | Median cross-section | `median(areas)` |
-| `std_cs_area` | float | voxels² | Area variability | `std(areas)` |
-| `is_sprout` | bool | - | Connected to endpoint | `degree(n1)=1 OR degree(n2)=1` |
+| `vessel_volume` | float | µm³ | Segment volume (approximation; biased low on oblique runs) | `Σ area(pᵢ) × v³` (assumes a 1-voxel step) |
+| `vessel_length` | float | µm | Path length | `Σ ‖pᵢ₊₁ - pᵢ‖ × v` |
+| `end_to_end_distance` | float | µm | Endpoint distance | `‖p_last - p_first‖ × v` |
+| `tortuosity` | float | ratio | Curvature measure | `vessel_length / end_to_end_distance` (clipped [0,5]) |
+| `is_sprout` | bool | - | Connected to a sprout tip | `sprout(n1) OR sprout(n2)` |
+| `mean_cross_sectional_area` | float | µm² | Mean cross-section | `mean(π × r_3D × r_2D) × v²` |
+| `median_cross_sectional_area` | float | µm² | Median cross-section | `median(areas) × v²` |
+| `std_cross_sectional_area` | float | µm² | Area variability | `std(areas) × v²` |
+| `mean_cross_sectional_area_exact` | float | µm² | Mean nearest-centerline cross-section | `mean(V(pᵢ) / Δᵢ) × v²` |
+| `median_cross_sectional_area_exact` | float | µm² | Median nearest-centerline cross-section | `median(V(pᵢ) / Δᵢ) × v²` |
+| `std_cross_sectional_area_exact` | float | µm² | Variability of the nearest-centerline cross-section | `std(V(pᵢ) / Δᵢ) × v²` |
+| `vessel_volume_exact` | float | µm³ | Segment volume from the nearest-centerline partition | `Σ V(pᵢ) × v³` |
 | `node1_degree` | int | count | First node degree | - |
 | `node2_degree` | int | count | Second node degree | - |
 | `orientation_z/y/x` | float | ratio | Direction vector | `(p_last - p_first) / ‖·‖` |
 | `sample` | str | - | Sample identifier | - |
+
+`V(pᵢ)` is the local vessel volume (voxel³) assigned to centerline voxel `pᵢ` and `Δᵢ` the local centerline step (Section 5.1). The four `_exact` columns are present only when the nearest-centerline areas were computed. Edges with fewer than two centerline points are skipped.
 
 **Tortuosity interpretation:**
 - 1.0: Perfectly straight
@@ -2256,22 +2772,24 @@ Stored in `{sample}_vessel_metrics_{method}.h5`, one row per edge.
 
 ## 4.3 Junction Metrics (HDF5)
 
-Stored in `{sample}_junction_metrics_{method}.h5`, one row per node.
+Stored in `{sample}_junction_metrics_{method}.h5`, one row per node, indexed by the node identifier. Distances are straight-line Euclidean distances between node positions, in µm.
 
 | Column | Type | Unit | Description | Formula |
 |--------|------|------|-------------|---------|
 | `z`, `y`, `x` | float | voxels | Node position | - |
-| `number_of_vessel_per_node` | int | count | Node degree | Edges connected |
-| `is_sprout_tip` | bool | - | Is endpoint | `degree = 1` |
-| `is_junction` | bool | - | Is branch point | `degree ≥ 2` |
-| `dist_nearest_junction` | float | voxels | To closest junction | `min(‖pos - pos_j‖)` |
-| `dist_nearest_endpoint` | float | voxels | To closest endpoint | `min(‖pos - pos_e‖)` |
-| `num_junction_neighbors` | int | count | Junctions within threshold | Within 250 voxels |
-| `num_endpoint_neighbors` | int | count | Endpoints within threshold | Within 250 voxels |
+| `node_degree` | int | count | Node degree | Edges connected |
+| `is_sprout_tip` | bool | - | Is sprout tip | Degree 1 in the skeleton graph before pruning |
+| `is_junction` | bool | - | Is not a sprout tip | `NOT is_sprout_tip` |
+| `nearest_junction_distance` | float | µm | To closest other junction | `min(‖pos - pos_j‖) × v` |
+| `nearest_sprout_tip_distance` | float | µm | To closest other sprout tip | `min(‖pos - pos_e‖) × v` |
+| `junction_neighbor_count` | int | count | Junctions within threshold | Within 500 µm |
+| `sprout_tip_neighbor_count` | int | count | Sprout tips within threshold | Within 500 µm |
 | `sample` | str | - | Sample identifier | - |
 
+When a sample has nodes of only one type, the columns of the missing type are NaN (distances) or 0 (counts).
+
 **Degree interpretation:**
-- Degree 1: Sprout tip (terminal)
+- Degree 1: Sprout tip (terminal) when `is_sprout_tip` is True; otherwise a free end left by pruning or border trimming
 - Degree 3: Typical bifurcation
 - Degree ≥ 4: Complex junction
 
@@ -2279,19 +2797,18 @@ Stored in `{sample}_junction_metrics_{method}.h5`, one row per node.
 
 ## Unit Conversions
 
-All metrics are in **voxels**. To convert to physical units:
+All lengths, areas and volumes are reported in physical units (**µm, µm², µm³**), converted with `voxel_size_um` (`--voxel_size_um`, default 2.0 µm, the isotropic grid of the inference output). Only the coordinate columns `z`, `y` and `x` of both tables remain in voxel indices. To convert them, or to derive a diameter from an area:
 
 ```python
-iso_voxel_um = 2.0  # µm per voxel (after isotropic rescaling)
+import numpy as np
 
-# Length
-length_um = length_voxels * iso_voxel_um
+voxel_size_um = 2.0  # the value passed as --voxel_size_um
 
-# Area
-area_um2 = area_voxels * (iso_voxel_um ** 2)
+# Node coordinates in µm
+junction_df[['z_um', 'y_um', 'x_um']] = junction_df[['z', 'y', 'x']] * voxel_size_um
 
-# Volume
-volume_um3 = volume_voxels * (iso_voxel_um ** 3)
+# Equivalent diameter (µm) from a cross-sectional area (µm²), as in the graph figure
+diameter_um = 2 * np.sqrt(vessel_df['median_cross_sectional_area'] / np.pi)
 ```
 
 ---
@@ -2313,15 +2830,38 @@ where:
   EDT_2D = distance in XY max-projection
 ```
 
+### Nearest-Centerline (Exact) Cross-Sectional Area
+
+```
+V(s)  = number of foreground voxels whose nearest skeleton voxel is s   (voxel³)
+Δ(s)  = mean length of the two centerline steps adjacent to s
+        (the single adjacent step at either end of an edge)
+A(s)  = V(s) / Δ(s)                                                     (voxel²)
+
+vessel_volume_exact = Σ V(s) × v³   over the centerline voxels s of an edge
+```
+
+### Sprout Taper Ratio (Pruning)
+
+```
+r = mean(A over the 20% of the branch nearest the tip) / A(origin)
+
+The area profile A along a terminal branch is resampled to 100 points;
+the half with the smaller mean area is the tip side, and the origin is the
+voxel at the opposite end. The branch is removed when r > tip_area_ratio_cutoff
+or when its length ≤ length_cutoff.
+```
+
 ### Tortuosity
 
 ```
 τ = L_path / L_straight
-  = Σ‖pᵢ₊₁ - pᵢ‖ / ‖p_last - p_first‖
+  = Σ‖pᵢ₊₁ - pᵢ‖ / ‖p_last - p_first‖     (clipped to [0, 5])
 
 Interpretation:
   τ = 1: Straight
   τ > 1: Curved
+  τ = 5: Closed loop or extremely curved segment (clipped value)
 ```
 
 ### Fractal Dimension (Box-Counting)
@@ -2330,8 +2870,10 @@ Interpretation:
 D = lim(ε→0) [log N(ε) / log(1/ε)]
 
 Implementation:
-  scales = {2^k : k = 1..log₂(min_dim)}
+  scales = unique(floor(2^k)), k = 20 values evenly spaced from
+           floor(log₂(min_dim)) down to 1   (box sizes from 2 voxels)
   N(ε) = count of non-empty boxes at scale ε
+  scales that give the same N(ε) are kept once
   D = slope of linear fit: log(N) vs log(1/ε)
 ```
 
@@ -2340,7 +2882,8 @@ Implementation:
 ```
 λ(ε) = Var(H) / Mean(H)²
 
-where H = histogram of points per box at scale ε
+where H = number of skeleton voxels in each non-empty box at scale ε;
+the reported lacunarity is the mean of λ(ε) over the scales kept for D
 
 Interpretation:
   λ ≈ 0: Homogeneous
@@ -2358,28 +2901,35 @@ Interpretation:
 cupy_chunk_processing(volume, func, chunk_size=(32, 256, 256))
 ```
 
+For graph analysis, smaller chunks are passed to `construct_vessel_network(chunk_size=(Z, 256, 256))`, while the overlap must remain larger than the largest vessel radius; `--no_exact_area` (`compute_exact_area=False`) also skips the nearest-centerline partition. During segmentation, the sliding-window batch sizes are fixed in `prediction.py` (16 or 32 tiles).
+
 ### Empty Graph Output
 
-**Causes:** No foreground, over-pruning  
+**Causes:** No foreground, over-pruning, vessels lying entirely within the border margins, a wrong voxel size  
 **Solutions:**
 1. Check `np.sum(mask) > 0`
-2. Increase `edt_cutoff` (e.g., 0.5)
-3. Decrease `length_cutoff` (e.g., 10)
+2. Increase `tip_area_ratio_cutoff` (e.g., 0.5), so that fewer terminal branches are treated as blob artifacts
+3. Decrease `prune_length_cutoff_um` and `min_spur_um`, or set `do_prune_graph=False` to inspect the unpruned topology
+4. Decrease `vicinity_xy_um` and `vicinity_z_um`
+5. Check that `--voxel_size_um` matches the mask grid, because every threshold is defined in µm
 
 ### Mesh Contraction Timeout
 
 **Solutions:**
-1. Increase `time_lim` (e.g., 600)
+1. Increase `contraction_timelim` of `process_directory` or `construct_vessel_network` (e.g., 600); the command line keeps the default of 300 s
 2. Use `skel_method='thinning'` for dense networks
 
 ### NaN in Metrics
 
 | Metric | Cause | Solution |
 |--------|-------|----------|
-| `tortuosity` | `shortest_path ≈ 0` | Filter short segments |
 | `orientation_*` | Zero-length vector | Remove degenerate edges |
-| `fractal_dimension` | Empty skeleton | Check mask |
-| `dist_nearest_*` | No nodes of type | Expected for some samples |
+| `skeleton_fractal_dimension`, `skeleton_lacunarity` | Graph without edges | Check mask |
+| `*_density_*` | `chip_volume` or `total_vessel_length` is 0 | Check mask and border margins |
+| Morphology and spacing columns | Graph without edges (columns left empty) | Check mask |
+| `nearest_*_distance` | No nodes of that type (NaN); a single node of that type (inf) | Expected for some samples |
+
+`tortuosity` is never NaN: a small constant (10⁻⁸ voxel) is added to the end-to-end distance, and the ratio is clipped to 5.
 
 ---
 
@@ -2406,4 +2956,4 @@ isort vascumap/
 
 ---
 
-*Last updated: December 2024*
+*Last updated: October 2026*

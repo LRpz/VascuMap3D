@@ -61,7 +61,7 @@ python -m vascumap.pipeline.main \
     --input_dir /path/to/lif/files \
     --model_p2p_path /path/to/translation.ckpt \
     --model_smp_path /path/to/segmentation.pth \
-    --crop_profile dorota --crop_profile_dir /path/to/crop_profiles
+    --crop_profile my_profile --crop_profile_dir /path/to/crop_profiles
 ```
 
 Fluorescence stacks are segmented directly, here the green fluorescent protein (GFP) channel of Nikon `.nd2` files without cropping:
