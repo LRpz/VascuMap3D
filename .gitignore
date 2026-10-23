@@ -101,3 +101,8 @@ data/
 *.pth
 *.pt
 
+
+# Local tooling and backups
+.claude/
+*.bak
+*.bak_*

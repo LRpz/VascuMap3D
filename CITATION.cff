@@ -1,0 +1,18 @@
+cff-version: 1.2.0
+message: "If VascuMap3D contributes to published work, please cite it as below."
+title: "VascuMap3D: 3D vascular network segmentation and graph analysis"
+type: software
+authors:
+  - family-names: Rappez
+    given-names: Luca
+version: 1.1.0
+date-released: 2026-10-23
+license: MIT
+repository-code: "https://github.com/LRpz/VascuMap3D"
+keywords:
+  - vasculature
+  - microscopy
+  - 3D segmentation
+  - deep learning
+  - graph analysis
+  - microfluidics
