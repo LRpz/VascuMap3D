@@ -1,5 +1,6 @@
 import numpy as np
 import dask.array as da
+import dask.threaded
 from skimage.morphology import skeletonize as skeletonize_3d
 from skimage import measure
 from scipy.spatial.distance import cdist
@@ -7,7 +8,7 @@ from skimage.draw import line_nd
 import networkx as nx
 from .utils import cupy_chunk_processing
 
-def skeletonize_3d_parallel(binary_volume, chunk_size=(128, 128, 128), iter=1):
+def skeletonize_3d_parallel(binary_volume, chunk_size=(512, 512, 512), overlap=128, iter=1):
     """
     Perform 3D skeletonization in parallel using Dask.
 
@@ -15,14 +16,22 @@ def skeletonize_3d_parallel(binary_volume, chunk_size=(128, 128, 128), iter=1):
 
     Args:
         binary_volume (np.ndarray): Input binary 3D volume.
-        chunk_size (tuple, optional): Size of chunks. Defaults to (128, 128, 128).
+        chunk_size (tuple, optional): Size of chunks. Defaults to (512, 512, 512).
+        overlap (int or tuple, optional): Overlap (halo) added around each chunk. A scalar is
+            applied to all axes; a (z, y, x) tuple sets it per axis. Each value is clamped so
+            it never exceeds the volume or chunk size along that axis (needed for thin-Z or
+            otherwise small volumes). Defaults to 128.
         iter (int, optional): Number of iterations for skeletonization (usually 1 is enough for full skeletonization). Defaults to 1.
 
     Returns:
         np.ndarray: 3D skeletonized volume.
     """
     dask_volume = da.from_array(binary_volume, chunks=chunk_size)
-    overlap = (2, 2, 2)
+    # per-axis depth, clamped so dask's "depth <= chunk size" constraint always holds and so
+    # a thin-Z volume does not drag the XY overlap down with it
+    if np.isscalar(overlap):
+        overlap = (overlap, overlap, overlap)
+    depth = tuple(int(min(overlap[i], binary_volume.shape[i], chunk_size[i])) for i in range(3))
     
     def skeletonize_chunk(chunk, iterations):
         result = chunk.copy()
@@ -33,13 +42,13 @@ def skeletonize_3d_parallel(binary_volume, chunk_size=(128, 128, 128), iter=1):
     skeleton = da.overlap.map_overlap(
         dask_volume,
         skeletonize_chunk,
-        depth=overlap,
+        depth=depth,
         boundary='none',
         dtype=bool,
         iterations=iter 
     )
     
-    return skeleton.compute(scheduler='threads')
+    return skeleton.compute(scheduler=dask.threaded.get)  # callable: no dask.distributed probe
 
 def measure_edge_length(coordinates):
     """
@@ -55,18 +64,31 @@ def measure_edge_length(coordinates):
     segment_lengths = np.linalg.norm(differences, axis=1)
     return np.sum(segment_lengths)
 
-def prune_graph(graph, area_3d, edt_cutoff=0.25, length_cutoff=25):
+def prune_graph(graph, area_3d, tip_area_ratio_cutoff=0.25, length_cutoff=25):
     """
-    Prune short branches from the graph based on length and EDT criteria.
+    Remove false-positive sprouts produced by thinning skeletonization inside large/thick
+    blobs, while preserving genuine sprouts.
 
-    Iteratively removes endpoint branches if they are short or have low EDT values 
-    (indicating they might be artifacts).
+    Rationale: thinning behaves well on tubular sections, but thick blobby regions spawn many
+    spurious degree-1 branches. A genuine sprout tapers, so the cross-sectional area at its
+    free tip is much smaller than the area at its origin (the junction it grows from). A
+    false-positive branch inside a blob stays comparably thick from origin to tip.
+
+    For each degree-1 endpoint branch this computes
+        value = mean(area near the tip) / (area at the origin/junction end)
+    and removes the branch if it is NOT a tapering sprout (value > tip_area_ratio_cutoff) OR
+    if it is too short to be meaningful (edge_length <= length_cutoff). Genuine sprouts (small
+    value, sufficient length) are kept. Iterates until no endpoint is removed.
 
     Args:
         graph (nx.Graph): NetworkX graph of the skeleton.
-        area_3d (np.ndarray): 3D volume containing cross-sectional areas (or EDT).
-        edt_cutoff (float, optional): Threshold for EDT-based pruning. Defaults to 0.25.
-        length_cutoff (int, optional): Minimum length for a branch to be kept. Defaults to 25.
+        area_3d (np.ndarray): 3D volume of cross-sectional AREAS at skeleton voxels (the
+            output of compute_cross_sectional_areas), in voxel^2.
+        tip_area_ratio_cutoff (float, optional): Maximum tip/origin area ratio for a branch to
+            be considered a genuine (tapering) sprout and kept. Branches with a larger ratio
+            are treated as blob artifacts and removed. Defaults to 0.25.
+        length_cutoff (int, optional): Endpoint branches with length <= this (voxels) are
+            removed regardless of taper. Defaults to 25.
 
     Returns:
         nx.Graph: Pruned graph.
@@ -81,20 +103,24 @@ def prune_graph(graph, area_3d, edt_cutoff=0.25, length_cutoff=25):
                 neighbor = neighbors[0]
                 edge_data = graph.get_edge_data(neighbor, node)
                 edge_length = measure_edge_length(edge_data['pts'])
-                branch_edt = area_3d[edge_data['pts'][:, 0], edge_data['pts'][:, 1], edge_data['pts'][:, 2]]
-                branch_edt_interp = np.interp(np.linspace(0, 1, 100), np.linspace(0, 1, branch_edt.size), branch_edt)
+                # cross-sectional area sampled along the branch centerline
+                branch_area = area_3d[edge_data['pts'][:, 0], edge_data['pts'][:, 1], edge_data['pts'][:, 2]]
+                branch_area_interp = np.interp(np.linspace(0, 1, 100), np.linspace(0, 1, branch_area.size), branch_area)
 
-                if np.mean(branch_edt_interp[:50]) < np.mean(branch_edt_interp[-50:]):
-                    neighbor_coords = edge_data['pts'][-1]
-                    part_oi = branch_edt_interp[:20]
+                # the tip is the thinner end; the origin (junction side) is the thicker end
+                if np.mean(branch_area_interp[:50]) < np.mean(branch_area_interp[-50:]):
+                    origin_coords = edge_data['pts'][-1]
+                    tip_area_profile = branch_area_interp[:20]
                 else:
-                    neighbor_coords = edge_data['pts'][0]
-                    part_oi = branch_edt_interp[-20:]
+                    origin_coords = edge_data['pts'][0]
+                    tip_area_profile = branch_area_interp[-20:]
 
-                neighbor_edt = area_3d[neighbor_coords[0], neighbor_coords[1], neighbor_coords[2]]
-                value = np.mean(part_oi)/(neighbor_edt+1e-6) 
+                origin_area = area_3d[origin_coords[0], origin_coords[1], origin_coords[2]]
+                value = np.mean(tip_area_profile) / (origin_area + 1e-6)
 
-                if value > edt_cutoff or edge_length <= length_cutoff:
+                # keep only genuine tapering sprouts (small tip/origin ratio) that are long
+                # enough; remove blob artifacts (large ratio) and short stubs
+                if value > tip_area_ratio_cutoff or edge_length <= length_cutoff:
                     graph.remove_node(node)
                     values.append(value)
 
@@ -280,7 +306,8 @@ def finalize_graph(G_repositioned, binary_edt):
 
     return G_final
 
-def collect_border_vicinity_edges(graph, image_shape, vicinity_z=1, vicinity_xy=50):
+def collect_border_vicinity_edges(graph, image_shape, vicinity_z=1, vicinity_xy=50,
+                                  keep_isolated=False):
     """
     Remove edges that are too close to the border of the volume.
 
@@ -308,8 +335,15 @@ def collect_border_vicinity_edges(graph, image_shape, vicinity_z=1, vicinity_xy=
     edges_to_remove = [edge for edge in border_vicinity_edges if trimmed_subgraph.has_edge(*edge)]
     trimmed_subgraph.remove_edges_from(edges_to_remove)
 
-    isolated_nodes = [node for node in trimmed_subgraph.nodes() if trimmed_subgraph.degree[node] == 0]
-    if isolated_nodes:
-        trimmed_subgraph.remove_nodes_from(isolated_nodes)
+    # A degree-0 node here is usually the leftover of an edge just removed for
+    # touching the border, hence the default. But when the caller asked sknw for
+    # iso=True, a degree-0 node is instead the ENTIRE skeleton of a compact,
+    # near-spherical object -- the only representation such a blob has -- and
+    # dropping it makes the returned graph disagree with area_image about which
+    # objects exist at all.
+    if not keep_isolated:
+        isolated_nodes = [node for node in trimmed_subgraph.nodes() if trimmed_subgraph.degree[node] == 0]
+        if isolated_nodes:
+            trimmed_subgraph.remove_nodes_from(isolated_nodes)
 
     return trimmed_subgraph

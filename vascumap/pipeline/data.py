@@ -39,6 +39,52 @@ def get_stack_from_lif(lif_file, stack_index=0, ref_voxel_size=[5, 2, 2]):
     
     return resize_dask(stack, rescale_factor), voxel_size, [nz, ny, nx]
 
+def get_stack_from_aics(img, channel_index, ref_voxel_size=[5, 2, 2]):
+    """
+    Extract a single-channel 3D stack from an AICSImage scene and resize it to a
+    reference voxel size.
+
+    AICSImage-based counterpart of get_stack_from_lif: works for any format
+    aicsimageio can read (e.g. .nd2), and pulls ONE channel (e.g. the GFP
+    fluorescence channel) instead of all channels. The result is channels-last
+    (Z, Y, X, 1) so the downstream pipeline can index it exactly like the
+    multi-channel LIF stack.
+
+    Args:
+        img (AICSImage): Image with the target scene already selected by the
+            caller via img.set_scene(...).
+        channel_index (int): Index of the channel to extract (e.g. GFP).
+        ref_voxel_size (list, optional): Target voxel size [z, y, x] in microns.
+            Defaults to [5, 2, 2].
+
+    Returns:
+        tuple:
+            - np.ndarray: Resized stack (Z, Y, X, 1).
+            - np.ndarray: Original voxel size [z, y, x] in microns.
+            - list: Original dimensions [nz, ny, nx].
+
+    Raises:
+        ValueError: If physical pixel sizes are missing, or the Z-range is
+            thinner than 160um.
+    """
+    pps = img.physical_pixel_sizes  # PhysicalPixelSizes(Z, Y, X) in microns
+    if pps is None or pps.Z is None or pps.Y is None or pps.X is None:
+        raise ValueError("Physical pixel sizes unavailable; cannot resize to reference voxel size.")
+
+    voxel_size = np.array([pps.Z, pps.Y, pps.X], dtype=float)
+    rescale_factor = voxel_size / np.array(ref_voxel_size, dtype=float)
+
+    # Single-channel volume (Z, Y, X); T=0 if a time axis is present.
+    data = np.asarray(img.get_image_data("ZYX", C=channel_index, T=0))
+    nz, ny, nx = data.shape
+
+    if voxel_size[0] * nz < 160:
+        raise ValueError(f"Z range is too thin, minimum is 160um, current is {voxel_size[0] * nz}um.")
+
+    stack = data[..., np.newaxis].astype(np.float32)  # (Z, Y, X, 1), channels-last
+
+    return resize_dask(stack, rescale_factor), voxel_size, [nz, ny, nx]
+
 def get_stack_from_lif_custom(lif_file, stack_index=0, ref_voxel_size=[5, 2, 2]):
     """
     Extract a cropped 3D stack from a LIF file centered on the signal in channel 2.

@@ -14,12 +14,14 @@ Modules:
     - pipeline: Inference and analysis pipelines
 
 Example:
-    >>> from vascumap.pipeline import run
-    >>> run(lif_dir_path="/path/to/data")
+    >>> from vascumap.pipeline import run, process_directory
+    >>> run(input_dir="/path/to/data", model_p2p_path="translation.ckpt",
+    ...     model_smp_path="segmentation.pth")
+    >>> process_directory("/path/to/data", suffix="_vessel_mask", save_local_metrics=True)
 """
 
-__version__ = "1.0.0"
-__author__ = "VascuMap3D Team"
+__version__ = "1.1.0"
+__author__ = "Luca Rappez"
 
 from . import models
 from . import pipeline

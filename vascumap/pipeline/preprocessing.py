@@ -426,7 +426,8 @@ def crop_stack_z(stack: np.ndarray, grid: np.ndarray, z_range: float, ref_voxel_
     z_cropped_stack = stack[z_idx, y_idx, x_idx]
     return z_cropped_stack
 
-def crop_stack(stack, crop_profile, bf_index, mode='3D', z_range=200, ref_voxel_size=[5, 2, 2], lif_path_root=None, filename=None):
+def crop_stack(stack, crop_profile, bf_index, mode='3D', z_range=200, ref_voxel_size=[5, 2, 2], lif_path_root=None, filename=None,
+               profile_dir='crop_profiles'):
     """
     Perform full stack cropping: Auto-focus, registration to template, and geometric cropping.
 
@@ -439,6 +440,8 @@ def crop_stack(stack, crop_profile, bf_index, mode='3D', z_range=200, ref_voxel_
         ref_voxel_size (list, optional): Voxel size. Defaults to [5, 2, 2].
         lif_path_root (str, optional): Path root for saving debug images.
         filename (str, optional): Filename for saving debug images.
+        profile_dir (str, optional): Folder holding <crop_profile>_rect.npy and
+            <crop_profile>_fiducials.npy. Defaults to 'crop_profiles'.
 
     Returns:
         np.ndarray: The final cropped stack.
@@ -456,21 +459,10 @@ def crop_stack(stack, crop_profile, bf_index, mode='3D', z_range=200, ref_voxel_
         window_size=400
         )
 
-    # Note: paths to profiles are hardcoded in original, this needs to be parameterized or relative
-    # Assuming default location or passed as arg would be better.
-    # For now, I will warn or use a placeholder. The original used C:\ANALYSIS\crop_profiles...
-    # I'll use the current working directory or a config.
-    
-    profile_path = os.path.join("crop_profiles", f"{crop_profile}_rect.npy")
-    fiducials_path = os.path.join("crop_profiles", f"{crop_profile}_fiducials.npy")
-    
-    # If not found, maybe check C:\ANALYSIS\crop_profiles as fallback to keep backward compatibility if user has that setup
-    if not os.path.exists(profile_path):
-         if os.path.exists(f'C:\\ANALYSIS\\crop_profiles\\{crop_profile}_rect.npy'):
-             profile_path = f'C:\\ANALYSIS\\crop_profiles\\{crop_profile}_rect.npy'
-             fiducials_path = f'C:\\ANALYSIS\\crop_profiles\\{crop_profile}_fiducials.npy'
-         else:
-             raise FileNotFoundError(f"Crop profile files not found for {crop_profile}. Expected at {profile_path} or C:\\ANALYSIS\\crop_profiles")
+    profile_path = os.path.join(profile_dir, f"{crop_profile}_rect.npy")
+    fiducials_path = os.path.join(profile_dir, f"{crop_profile}_fiducials.npy")
+    if not (os.path.exists(profile_path) and os.path.exists(fiducials_path)):
+        raise FileNotFoundError(f"Crop profile '{crop_profile}' not found: expected {profile_path} and {fiducials_path}")
 
     rect_coords = np.load(profile_path)
     neck_coords_all = np.load(fiducials_path)

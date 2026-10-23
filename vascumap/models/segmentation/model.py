@@ -4,6 +4,9 @@ import torch.nn as nn
 import segmentation_models_pytorch as smp
 from .model_utils import build_model
 import torchmetrics
+# torchmetrics 1.x removed `torchmetrics.Dice`; for binary segmentation the Dice
+# coefficient equals the F1 score, so BinaryF1Score is a drop-in.
+from torchmetrics.classification import BinaryF1Score
 
 class SegmentationModule(pl.LightningModule):
     """
@@ -30,10 +33,10 @@ class SegmentationModule(pl.LightningModule):
         self.dice_loss = smp.losses.DiceLoss(smp.losses.BINARY_MODE, from_logits=True)
         self.bce_loss = nn.BCEWithLogitsLoss()
         
-        # Metrics
-        self.train_dice = torchmetrics.Dice(task="binary")
+        # Metrics (binary Dice == F1)
+        self.train_dice = BinaryF1Score()
         self.train_iou = torchmetrics.JaccardIndex(task="binary")
-        self.val_dice = torchmetrics.Dice(task="binary")
+        self.val_dice = BinaryF1Score()
         self.val_iou = torchmetrics.JaccardIndex(task="binary")
 
     def forward(self, x):
@@ -89,7 +92,7 @@ class SegmentationModule(pl.LightningModule):
         
         # Replicating original StepLR logic: step_size=int(n_epochs/2), gamma=0.5
         step_size = int(self.hparams.max_epochs / 2)
-        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=step_size, gamma=0.5, verbose=False)
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=step_size, gamma=0.5)
         
         return {
             "optimizer": optimizer,

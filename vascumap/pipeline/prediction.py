@@ -4,8 +4,8 @@ import numpy as np
 import gc
 from monai.inferers import SliceInferer, SlidingWindowInferer
 import segmentation_models_pytorch as smp
-from vascumap.models.image_translation.utils import Pix2Pix
-# from vascumap.models.segmentation.model import SegmentationModule # Use if loading lightning checkpoint, but original code loaded a .pth or .ckpt with specific logic
+from ..models.image_translation.utils import Pix2Pix
+from ..models.segmentation.model_utils import adapt_input_model
 
 def load_pix2pix(model_path, device='cuda'):
     """
@@ -36,35 +36,35 @@ def load_segmentation_model(model_path, device='cuda'):
     Returns:
         torch.nn.Module: The loaded model in eval mode.
     """
-    # Original code used smp.Unet with adapt_input_model. 
-    # Since we refactored model_utils, we should use that or just recreate logic here if we want to support old checkpoints.
-    # Assuming we want to support the checkpoints trained with the new code or old code? 
-    # If old code used smp.Unet directly + adapt, we should replicate.
-    
-    # Replicating the load_smp logic from original inference.py
-    from vascumap.models.segmentation.model_utils import adapt_input_model
-    
+    # U-Net (MiT-B5) with its first layer adapted to one input channel, as in training
     model = smp.Unet(encoder_name='mit_b5', classes=1, in_channels=3, encoder_weights=None)
     model = adapt_input_model(model)
     
-    checkpoint = torch.load(model_path, map_location='cpu')
-    
-    if 'model_state_dict' in checkpoint:
-        model.load_state_dict(checkpoint['model_state_dict'])
-    elif 'state_dict' in checkpoint: # Lightning checkpoint
-         # Lightning checkpoints have "model." prefix usually if using LightningModule
-         state_dict = checkpoint['state_dict']
-         # Remove "model." prefix if present
-         new_state_dict = {}
-         for k, v in state_dict.items():
-             if k.startswith('model.'):
-                 new_state_dict[k[6:]] = v
-             else:
-                 new_state_dict[k] = v
-         model.load_state_dict(new_state_dict)
+    # Trusted local checkpoints; weights_only=False so a full Lightning .ckpt
+    # (which also carries optimizer states / callbacks / hparams, not just tensors)
+    # loads on torch >= 2.6, where weights_only now defaults to True.
+    checkpoint = torch.load(model_path, map_location='cpu', weights_only=False)
+
+    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+        # Catalyst / our exported .pth
+        state = checkpoint['model_state_dict']
+    elif isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
+        # PyTorch Lightning .ckpt: the model weights live under a "model." prefix;
+        # any non-"model." keys (torchmetrics / loss states) are dropped.
+        state = {k[len('model.'):]: v
+                 for k, v in checkpoint['state_dict'].items()
+                 if k.startswith('model.')}
     else:
-        model.load_state_dict(checkpoint)
-        
+        # bare state_dict
+        state = checkpoint
+
+    # strict=False tolerates format quirks; report any mismatch instead of crashing.
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    if missing or unexpected:
+        print(f"[load_segmentation_model] non-strict load: missing={len(missing)} "
+              f"unexpected={len(unexpected)} (first missing: {missing[:2]}, "
+              f"first unexpected: {unexpected[:2]})")
+
     return model.eval()
 
 def predict_pix2pix(model_p2p, stack_bf, device, n_iter=1):
@@ -127,8 +127,8 @@ def predict_mask(model_smp, vessel_pred, device):
     vessel_pred_tensor = torch.tensor(vessel_pred[None, None, ...]).float().to(device)
 
     axial_inferer = SliceInferer(
-        roi_size=(1024, 1024), 
-        sw_batch_size=3, 
+        roi_size=(256, 256), 
+        sw_batch_size=16, 
         progress=True, 
         mode="gaussian",
         overlap=0.5,
@@ -173,8 +173,8 @@ def predict_mask_ortho(model_smp, vessel_pred_iso, device):
     model_smp.to(device)
 
     axial_inferer = SliceInferer(
-        roi_size=(1024, 1024), 
-        sw_batch_size=4, 
+        roi_size=(256, 256), 
+        sw_batch_size=32, 
         progress=True, 
         mode="gaussian",
         overlap=0.5,

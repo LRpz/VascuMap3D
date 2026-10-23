@@ -171,6 +171,7 @@ def resize_dask(stack, rescale_factor):
         np.ndarray: Resized stack.
     """
     import dask.array as da
+    import dask.threaded
     from skimage.transform import resize
     
     stack_dask = da.from_array(stack, chunks='auto')
@@ -185,7 +186,7 @@ def resize_dask(stack, rescale_factor):
         ),
         dtype=stack.dtype
     )
-    return rescaled_stack.compute()
+    return rescaled_stack.compute(scheduler=dask.threaded.get)  # callable: no dask.distributed probe
 
 def process_vessel_mask(vessel_proba, ortho=False):
     """

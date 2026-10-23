@@ -32,13 +32,16 @@ class SegmentationDataset(Dataset):
         image = tif.imread(image_path)
         
         image = contrast(image, .1, 99.9)
-        image = scale(image)
+        # Cast to float32: np.percentile bounds promote contrast/scale to float64
+        # in modern numpy, which clashes with the float32/fp16 model weights.
+        image = scale(image).astype(np.float32)
         image = new_axis(image)
 
         result = {"image": image}
 
         if self.masks is not None:
-            mask = tif.imread(self.masks[idx]).astype(int)
+            mask = tif.imread(self.masks[idx])
+            mask = (np.nan_to_num(mask, nan=0.0, posinf=0.0, neginf=0.0) > 0).astype(int)
             result["mask"] = mask
 
         if self.transforms is not None:

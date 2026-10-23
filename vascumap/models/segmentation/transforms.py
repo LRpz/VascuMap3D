@@ -1,8 +1,9 @@
 import numpy as np
 
+import cv2
 import albumentations as albu
 from albumentations.core.transforms_interface import ImageOnlyTransform
-from albumentations.pytorch import ToTensor
+from albumentations.pytorch import ToTensorV2
 from skimage.filters import apply_hysteresis_threshold
 
 def scale(arr):
@@ -80,15 +81,25 @@ def single_level_thresholding(arr, threshold=0.5):
 def hard_transforms():
     """
     Returns a list of 'hard' augmentations for training.
-    
-    Includes: Flip, ShiftScaleRotate.
+
+    Includes: horizontal/vertical flip, affine (shift/scale/rotate).
+
+    NOTE: albumentations >= 2.0 removed `Flip` and `ShiftScaleRotate`; this uses
+    their modern equivalents (HorizontalFlip + VerticalFlip, and Affine).
 
     Returns:
         list: List of Albumentations transforms.
     """
     return [
-        albu.Flip(),
-        albu.ShiftScaleRotate(),
+        albu.HorizontalFlip(p=0.5),
+        albu.VerticalFlip(p=0.5),
+        albu.Affine(
+            translate_percent=(-0.0625, 0.0625),
+            scale=(0.9, 1.1),
+            rotate=(-45, 45),
+            border_mode=cv2.BORDER_REFLECT_101,   # mirror (matches old ShiftScaleRotate)
+            p=0.5,
+        ),
     ]
 
 def post_transforms():
@@ -100,7 +111,7 @@ def post_transforms():
     Returns:
         list: List of Albumentations transforms.
     """
-    return [ToTensor()]
+    return [ToTensorV2()]
 
 def compose(transforms_to_compose):
     """
